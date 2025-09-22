@@ -14,8 +14,11 @@ Python toolkit for building a local SQLite metadata store and search layer for I
 # Install in editable mode with dev extras
 pip install -e .[dev]
 
-# Run ingestion for a table id
-python -m sidra_database.cli 6579 2093
+# Ingest one or more agregados into SQLite
+python -m sidra_database.cli ingest 6579 2093
+
+# Run a semantic search against stored embeddings
+python -m sidra_database.cli search "população por sexo" --types variable classification
 
 # Run tests and linters
 pytest
@@ -23,4 +26,4 @@ ruff check src tests
 mypy src
 ```
 
-Set `SIDRA_DATABASE_PATH` to control the SQLite location and `SIDRA_EMBEDDING_API_URL` if LM Studio runs on a different port.
+Set `SIDRA_DATABASE_PATH` to control the SQLite location and `SIDRA_EMBEDDING_API_URL` if LM Studio runs on a different port. The CLI search command will call the configured LM Studio embedding endpoint to embed the query and return enriched metadata for each match.

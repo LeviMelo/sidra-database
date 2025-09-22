@@ -7,7 +7,14 @@ import asyncio
 
 import pytest
 
-from sidra_database import ensure_schema, get_database_path, ingest_agregado, semantic_search, get_settings
+from sidra_database import (
+    ensure_schema,
+    get_database_path,
+    ingest_agregado,
+    semantic_search,
+    semantic_search_with_metadata,
+    get_settings,
+)
 from sidra_database.db import create_connection
 
 
@@ -235,3 +242,60 @@ def test_semantic_search_orders_results():
         entity_types=["variable"],
     )
     assert [item.entity_id for item in filtered] == ["var_a", "var_b"]
+
+
+def test_semantic_search_with_metadata_enriches_results():
+    ensure_schema()
+    client = FakeSidraClient()
+    embedding_vectors = [
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+        (0.5, 0.5, 0.0),
+        (0.5, -0.5, 0.0),
+    ]
+    embedding_client = FakeEmbeddingClient(embedding_vectors)
+    asyncio.run(ingest_agregado(1234, client=client, embedding_client=embedding_client))
+
+    class QueryEmbeddingClient:
+        def __init__(self, vector: Sequence[float]) -> None:
+            self._model = "fake-model"
+            self._vector = [float(value) for value in vector]
+
+        @property
+        def model(self) -> str:
+            return self._model
+
+        def embed_text(self, text: str, *, model: str | None = None) -> list[float]:
+            assert model == self._model
+            return list(self._vector)
+
+    aggregate_results = semantic_search_with_metadata(
+        "table overview",
+        limit=3,
+        embedding_client=QueryEmbeddingClient((1.0, 0.0, 0.0)),
+    )
+    assert aggregate_results
+    top = aggregate_results[0]
+    assert top.entity_type == "agregado"
+    assert top.metadata["table_id"] == "1234"
+    assert top.title == "Tabela teste"
+    assert "Pesquisa demo" in (top.description or "")
+
+    variable_results = semantic_search_with_metadata(
+        "variable",
+        limit=3,
+        embedding_client=QueryEmbeddingClient((0.0, 1.0, 0.0)),
+    )
+    variable = next(item for item in variable_results if item.entity_type == "variable")
+    assert variable.metadata["unit"] == "Pessoas"
+    assert "Table 1234" in (variable.description or "")
+
+    classification_results = semantic_search_with_metadata(
+        "classification",
+        limit=3,
+        embedding_client=QueryEmbeddingClient((0.0, 0.0, 1.0)),
+    )
+    classification = next(item for item in classification_results if item.entity_type == "classification")
+    assert classification.metadata["classification_id"] == "1"
+    assert "Summarization" in (classification.description or "")
