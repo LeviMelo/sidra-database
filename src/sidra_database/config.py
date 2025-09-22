@@ -1,8 +1,8 @@
 """Application configuration via environment variables."""
 from __future__ import annotations
-
+from pydantic_settings import BaseSettings
+from pydantic import Field
 from functools import lru_cache
-from pydantic import BaseSettings, Field
 
 
 class Settings(BaseSettings):

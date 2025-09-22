@@ -4,6 +4,7 @@ from .api_client import SidraApiClient, SidraApiError
 from .ingest import ingest_agregado, ingest_agregado_sync
 from .db import ensure_schema, sqlite_session, create_connection, get_database_path
 from .embedding import EmbeddingClient
+from .search import SemanticMatch, semantic_search
 
 __all__ = [
     "Settings",
@@ -17,4 +18,9 @@ __all__ = [
     "create_connection",
     "get_database_path",
     "EmbeddingClient",
+    "SemanticMatch",
+    "semantic_search",
 ]
+
+
+

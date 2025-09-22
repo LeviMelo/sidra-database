@@ -19,6 +19,12 @@ class EmbeddingClient:
         self._timeout = timeout or settings.request_timeout
         self._headers = {"Content-Type": "application/json", "User-Agent": settings.user_agent}
 
+    @property
+    def model(self) -> str:
+        """Return the default embedding model configured for this client."""
+
+        return self._model
+
     def embed_text(self, text: str, *, model: str | None = None) -> Sequence[float]:
         payload = {
             "model": model or self._model,

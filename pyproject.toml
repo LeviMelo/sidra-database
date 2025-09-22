@@ -35,6 +35,9 @@ minversion = "8.0"
 addopts = "-ra --strict-markers"
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "asyncio: mark test as asyncio-powered",
+]
 
 [tool.ruff]
 line-length = 100
