@@ -1,0 +1,8 @@
+{
+  "database_path": "sidra.db",
+  "embedding_api_url": "http://127.0.0.1:1234/v1/embeddings",
+  "embedding_model": "text-embedding-qwen3-embedding-0.6b@f16",
+  "request_timeout": 30.0,
+  "request_retries": 3,
+  "municipality_national_threshold": 4000
+}

@@ -129,7 +129,9 @@ def test_ingest_agregado_writes_metadata(monkeypatch: pytest.MonkeyPatch):
 
     conn = create_connection()
     try:
-        row = conn.execute("SELECT nome, pesquisa, assunto FROM agregados WHERE id = 1234").fetchone()
+        row = conn.execute(
+            "SELECT nome, pesquisa, assunto, municipality_locality_count, covers_national_municipalities FROM agregados WHERE id = 1234"
+        ).fetchone()
         assert row["nome"] == "Tabela teste"
         assert row["pesquisa"] == "Pesquisa demo"
         assert row["municipality_locality_count"] == 5

@@ -30,4 +30,4 @@ ruff check src tests
 mypy src
 ```
 
-Set `SIDRA_DATABASE_PATH` to control the SQLite location and `SIDRA_EMBEDDING_API_URL` if LM Studio runs on a different port. The CLI search command will call the configured LM Studio embedding endpoint to embed the query and return enriched metadata for each match. Use the `list` subcommand to quickly surface agregados whose municipality coverage exceeds the configured national threshold (`SIDRA_MUNICIPALITY_NATIONAL_THRESHOLD`, default 4000).
+Configuration values can be supplied via a simple JSON file (`sidra.config.json`) or environment variables. Copy `sidra.config.json.example` to `sidra.config.json` and adjust values as needed. The CLI search command will call the configured LM Studio embedding endpoint to embed the query and return enriched metadata for each match. Use the `list` subcommand to quickly surface agregados whose municipality coverage exceeds the configured national threshold (`SIDRA_MUNICIPALITY_NATIONAL_THRESHOLD`, default 4000).

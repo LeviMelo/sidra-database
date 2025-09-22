@@ -1,8 +1,11 @@
 """Application configuration via environment variables."""
 from __future__ import annotations
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 from functools import lru_cache
+import os
+import json
+from pathlib import Path
 
 
 class Settings(BaseSettings):
@@ -41,16 +44,35 @@ class Settings(BaseSettings):
         description="Minimum municipality count (N6) to flag national coverage.",
     )
 
-    class Config:
-        env_prefix = "SIDRA_"
-        case_sensitive = False
+    model_config = SettingsConfigDict(
+        env_prefix="SIDRA_",
+        case_sensitive=False,
+    )
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """Return cached Settings instance."""
 
+    override = _load_config_file()
+    if override:
+        return Settings(**override)
     return Settings()
+
+
+def _load_config_file() -> dict[str, object] | None:
+    candidates = [
+        Path(os.getenv("SIDRA_CONFIG_PATH", "sidra.config.json")),
+        Path("sidra.config.json"),
+    ]
+    for path in candidates:
+        if path.is_file():
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    return json.load(handle)
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(f"Failed to load config file at {path}") from exc
+    return None
 
 
 __all__ = ["Settings", "get_settings"]
