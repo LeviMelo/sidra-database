@@ -60,6 +60,26 @@ class SidraApiClient:
     async def fetch_localities(self, agregado_id: int, level: str) -> Any:
         return await self._get_json(f"/{agregado_id}/localidades/{level}")
 
+    async def fetch_catalog(
+        self,
+        *,
+        subject_id: int | None = None,
+        periodicity: str | None = None,
+        levels: list[str] | None = None,
+    ) -> Any:
+        """Return the agregados catalog grouped by survey/subject."""
+
+        params: dict[str, Any] = {}
+        if subject_id is not None:
+            params["assunto"] = subject_id
+        if periodicity:
+            params["periodicidade"] = periodicity
+        if levels:
+            normalized = [code.upper() for code in levels if code]
+            if normalized:
+                params["nivel"] = "|".join(normalized)
+        return await self._get_json("", params=params or None)
+
     async def fetch_values(
         self,
         agregado_id: int,

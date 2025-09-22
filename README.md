@@ -24,6 +24,9 @@ python -m sidra_database.cli search "população por sexo" --types variable clas
 # List agregados covering most municipalities
 python -m sidra_database.cli list --requires-national-munis
 
+# Ingest every table with UF or municipality coverage
+python scripts/ingest_by_coverage.py
+
 # Run tests and linters
 pytest
 ruff check src tests

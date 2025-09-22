@@ -55,9 +55,31 @@ def get_settings() -> Settings:
     """Return cached Settings instance."""
 
     override = _load_config_file()
+    env_override = _collect_env_overrides()
     if override:
-        return Settings(**override)
+        merged = {**override, **env_override}
+        return Settings(**merged)
+    if env_override:
+        return Settings(**env_override)
     return Settings()
+
+
+def _collect_env_overrides() -> dict[str, object]:
+    overrides: dict[str, object] = {}
+    for field_name in Settings.model_fields:
+        env_key = f"SIDRA_{field_name.upper()}"
+        value = _lookup_environment(env_key)
+        if value is not None:
+            overrides[field_name] = value
+    return overrides
+
+
+def _lookup_environment(name: str) -> str | None:
+    candidates = {name, name.upper(), name.lower()}
+    for candidate in candidates:
+        if candidate in os.environ:
+            return os.environ[candidate]
+    return None
 
 
 def _load_config_file() -> dict[str, object] | None:

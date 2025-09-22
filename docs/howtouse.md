@@ -98,44 +98,16 @@ python -m sidra_database.cli ingest 6579 2093
 - `--concurrent N`: adjust concurrent requests (default 4).
 
 ### 5.2 Bulk Ingestion with Coverage Criteria
-To ingest every table that exposes UF (`N3`) or municipality (`N6`) coverage, use a small helper script. Create `scripts/ingest_cov_tables.py`:
-```python
-import asyncio
-import httpx
-from sidra_database import ingest_agregado
-
-BASE_URL = "https://servicodados.ibge.gov.br/api/v3/agregados"
-TARGET_CODES = {"N3", "N6"}
-
-async def fetch_ids() -> list[int]:
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.get(BASE_URL)
-        resp.raise_for_status()
-    ids = set()
-    for survey in resp.json():
-        for table in survey.get("agregados", []):
-            levels = set(table.get("nivelTerritorial") or [])
-            if levels & TARGET_CODES:
-                ids.add(int(table["id"]))
-    return sorted(ids)
-
-async def main() -> None:
-    ids = await fetch_ids()
-    print(f"Ingesting {len(ids)} agregados with UF or municipality coverage")
-    for idx in range(0, len(ids), 50):  # chunk to stay polite with the API
-        batch = ids[idx:idx + 50]
-        await asyncio.gather(*(ingest_agregado(table_id) for table_id in batch))
-
-asyncio.run(main())
-```
-Run it:
+To ingest every table that exposes UF (`N3`) or municipality (`N6`) coverage, use the CLI discovery command:
 ```powershell
-python scripts/ingest_cov_tables.py
+python -m sidra_database.cli ingest-coverage --any-level N3 N6 --concurrent 8
 ```
-This script:
-- Pulls the public agregados catalog once.
-- Filters for tables containing level `N3` or `N6`.
-- Ingests in batches of 50 to balance throughput and rate limits.
+This command:
+- Pulls the public agregados catalog once and filters the rows that expose the requested territorial levels.
+- Skips tables already present in the SQLite catalog (unless `--no-skip-existing` is supplied).
+- Streams the remaining IDs to the ingestion pipeline with configurable concurrency.
+
+Add `--dry-run` to preview which tables would be ingested without touching the database, or combine filters such as `--subject-contains agricultura` to narrow the catalog search. A thin wrapper remains at `scripts/ingest_by_coverage.py` for automation workflows that prefer a standalone script.
 
 ### 5.3 Incremental Refreshes
 Re-run the ingestion command for any table to update metadata and embeddings. Hashing avoids redundant embedding calls if nothing changed.
