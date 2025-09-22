@@ -13,6 +13,7 @@ from sidra_database import (
     ingest_agregado,
     semantic_search,
     semantic_search_with_metadata,
+    list_agregados,
     get_settings,
 )
 from sidra_database.db import create_connection
@@ -28,6 +29,10 @@ class FakeSidraClient:
                 {"id": "11", "nome": "Rondonia", "nivel": {"nome": "Unidade da Federacao"}},
                 {"id": "12", "nome": "Acre", "nivel": {"nome": "Unidade da Federacao"}},
             ],
+            ("Administrativo", "N6"): [
+                {"id": str(code), "nome": f"Municipio {code}", "nivel": {"nome": "Municipio"}}
+                for code in range(1, 6)
+            ],
         }
 
     async def fetch_metadata(self, agregado_id: int):
@@ -40,7 +45,7 @@ class FakeSidraClient:
             "URL": "https://sidra.ibge.gov.br/tabela/1234",
             "periodicidade": {"frequencia": "anual", "inicio": 2000, "fim": 2020},
             "nivelTerritorial": {
-                "Administrativo": ["N1", "N3"],
+                "Administrativo": ["N1", "N3", "N6"],
                 "Especial": [],
                 "IBGE": [],
             },
@@ -106,7 +111,9 @@ def override_db_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         db_path.unlink()
 
 
-def test_ingest_agregado_writes_metadata():
+def test_ingest_agregado_writes_metadata(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SIDRA_MUNICIPALITY_NATIONAL_THRESHOLD", "4")
+    get_settings.cache_clear()
     ensure_schema()
     client = FakeSidraClient()
     embedding_vectors = [
@@ -125,6 +132,8 @@ def test_ingest_agregado_writes_metadata():
         row = conn.execute("SELECT nome, pesquisa, assunto FROM agregados WHERE id = 1234").fetchone()
         assert row["nome"] == "Tabela teste"
         assert row["pesquisa"] == "Pesquisa demo"
+        assert row["municipality_locality_count"] == 5
+        assert row["covers_national_municipalities"] == 1
 
         variables = conn.execute("SELECT COUNT(*) FROM variables WHERE agregado_id = 1234").fetchone()[0]
         assert variables == 1
@@ -140,6 +149,18 @@ def test_ingest_agregado_writes_metadata():
             ("N3",),
         ).fetchone()[0]
         assert localities == 2
+
+        level_row = conn.execute(
+            "SELECT locality_count FROM agregados_levels WHERE agregado_id = 1234 AND level_id = ?",
+            ("N3",),
+        ).fetchone()
+        assert level_row["locality_count"] == 2
+
+        muni_level_row = conn.execute(
+            "SELECT locality_count FROM agregados_levels WHERE agregado_id = 1234 AND level_id = ?",
+            ("N6",),
+        ).fetchone()
+        assert muni_level_row["locality_count"] == 5
 
         embedding_rows = conn.execute(
             """
@@ -244,7 +265,9 @@ def test_semantic_search_orders_results():
     assert [item.entity_id for item in filtered] == ["var_a", "var_b"]
 
 
-def test_semantic_search_with_metadata_enriches_results():
+def test_semantic_search_with_metadata_enriches_results(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SIDRA_MUNICIPALITY_NATIONAL_THRESHOLD", "4")
+    get_settings.cache_clear()
     ensure_schema()
     client = FakeSidraClient()
     embedding_vectors = [
@@ -281,6 +304,7 @@ def test_semantic_search_with_metadata_enriches_results():
     assert top.metadata["table_id"] == "1234"
     assert top.title == "Tabela teste"
     assert "Pesquisa demo" in (top.description or "")
+    assert top.metadata["covers_national_municipalities"] == "1"
 
     variable_results = semantic_search_with_metadata(
         "variable",
@@ -299,3 +323,32 @@ def test_semantic_search_with_metadata_enriches_results():
     classification = next(item for item in classification_results if item.entity_type == "classification")
     assert classification.metadata["classification_id"] == "1"
     assert "Summarization" in (classification.description or "")
+
+
+def test_list_agregados_filters(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SIDRA_MUNICIPALITY_NATIONAL_THRESHOLD", "4")
+    get_settings.cache_clear()
+    ensure_schema()
+    client = FakeSidraClient()
+    embedding_vectors = [
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+        (0.5, 0.5, 0.0),
+        (0.5, -0.5, 0.0),
+    ]
+    embedding_client = FakeEmbeddingClient(embedding_vectors)
+    asyncio.run(ingest_agregado(1234, client=client, embedding_client=embedding_client))
+
+    rows = list_agregados()
+    assert len(rows) == 1
+    record = rows[0]
+    assert record.id == 1234
+    assert record.covers_national_municipalities is True
+    assert record.municipality_locality_count == 5
+
+    national = list_agregados(requires_national_munis=True)
+    assert len(national) == 1
+
+    narrow = list_agregados(min_municipality_count=10)
+    assert narrow == []

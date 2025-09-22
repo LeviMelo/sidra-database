@@ -9,6 +9,7 @@ from .config import get_settings
 from .embedding import EmbeddingClient
 from .ingest import ingest_agregado
 from .search import semantic_search_with_metadata
+from .catalog import list_agregados
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,6 +50,31 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Override embedding model identifier",
+    )
+
+    list_parser = subparsers.add_parser("list", help="List stored agregados with optional coverage filters")
+    list_parser.add_argument(
+        "--requires-national-munis",
+        action="store_true",
+        help="Only show agregados flagged with national municipal coverage",
+    )
+    list_parser.add_argument(
+        "--min-municipalities",
+        type=int,
+        default=None,
+        help="Only show agregados covering at least this many municipalities",
+    )
+    list_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum number of rows to display (default: 20)",
+    )
+    list_parser.add_argument(
+        "--order-by",
+        choices=["municipalities", "id", "name", "fetched"],
+        default="municipalities",
+        help="Sort order for results (default: municipalities)",
     )
 
     return parser
@@ -93,6 +119,26 @@ def main(argv: Sequence[str] | None = None) -> None:
             print(f"   {item.title}")
             if item.description:
                 print(f"   {item.description}")
+        return
+
+    if args.command == "list":
+        rows = list_agregados(
+            requires_national_munis=args.requires_national_munis,
+            min_municipality_count=args.min_municipalities,
+            limit=args.limit,
+            order_by=args.order_by,
+        )
+        if not rows:
+            print("No agregados matched the provided filters.")
+            return
+        for row in rows:
+            coverage = f"municipalities={row.municipality_locality_count:,}"
+            if row.covers_national_municipalities:
+                coverage += " (national)"
+            subject = f"assunto={row.assunto}" if row.assunto else "assunto=?"
+            survey = f"pesquisa={row.pesquisa}" if row.pesquisa else "pesquisa=?"
+            print(f"{row.id}: {row.nome}")
+            print(f"   {subject} | {survey} | {coverage} | fetched={row.fetched_at}")
         return
 
     parser.error("Unknown command")

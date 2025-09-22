@@ -36,6 +36,10 @@ class Settings(BaseSettings):
         default="sidra-database/0.1",
         description="User agent string for outbound HTTP requests.",
     )
+    municipality_national_threshold: int = Field(
+        default=4000,
+        description="Minimum municipality count (N6) to flag national coverage.",
+    )
 
     class Config:
         env_prefix = "SIDRA_"

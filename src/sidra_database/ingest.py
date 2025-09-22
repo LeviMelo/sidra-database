@@ -10,10 +10,12 @@ from typing import Any, NamedTuple, Sequence
 import orjson
 
 from .api_client import SidraApiClient
+from .config import get_settings
 from .db import ensure_schema, sqlite_session
 from .embedding import EmbeddingClient
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+MUNICIPALITY_LEVEL_CODE = "N6"
 
 
 class _EmbeddingTarget(NamedTuple):
@@ -107,12 +109,12 @@ def _canonical_classification_text(metadata: dict[str, Any], classificacao: dict
         f"Table {metadata.get('id')}: {str(metadata.get('nome') or '').strip()}".strip(),
         f"Classification {classificacao.get('id')}: {str(classificacao.get('nome') or '').strip()}".strip(),
     ]
-    summarizacao = classificacao.get("sumarizacao")
-    if isinstance(sumarizacao, dict):
-        status = summarizacao.get("status")
+    summary_payload = classificacao.get("sumarizacao")
+    if isinstance(summary_payload, dict):
+        status = summary_payload.get("status")
         if status is not None:
             lines.append(f"Summarization enabled: {bool(status)}")
-        excecao = summarizacao.get("excecao")
+        excecao = summary_payload.get("excecao")
         if excecao:
             lines.append(f"Exceptions: {_json_dump_text(excecao)}")
     return "\n".join(line for line in lines if line)
@@ -268,6 +270,7 @@ async def ingest_agregado(
 
     ensure_schema()
     own_client = False
+    settings = get_settings()
     if client is None:
         client = SidraApiClient()
         own_client = True
@@ -279,12 +282,26 @@ async def ingest_agregado(
         nivel_groups: dict[str, list[str]] = metadata.get("nivelTerritorial", {}) or {}
 
         locality_payloads: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        locality_counts: dict[tuple[str, str], int] = {}
+        municipality_locality_count: int = 0
         for level_type, codes in nivel_groups.items():
             if not codes:
                 continue
             for level_code in codes:
                 localities = await client.fetch_localities(agregado_id, level_code)
-                locality_payloads[(level_type, level_code)] = list(localities)
+                payload = list(localities)
+                locality_payloads[(level_type, level_code)] = payload
+                count = len(payload)
+                locality_counts[(level_type, level_code)] = count
+                if level_code.upper() == MUNICIPALITY_LEVEL_CODE:
+                    if count > municipality_locality_count:
+                        municipality_locality_count = count
+
+        threshold_setting = max(0, int(settings.municipality_national_threshold))
+        if threshold_setting == 0:
+            covers_national_munis = 1 if municipality_locality_count > 0 else 0
+        else:
+            covers_national_munis = 1 if municipality_locality_count >= threshold_setting else 0
 
         embedding_targets = _build_embedding_targets(agregado_id, metadata)
         fetched_at = _utcnow()
@@ -293,8 +310,9 @@ async def ingest_agregado(
             conn.execute(
                 """
                 INSERT OR REPLACE INTO agregados (
-                    id, nome, pesquisa, assunto, url, freq, periodo_inicio, periodo_fim, raw_json, fetched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    id, nome, pesquisa, assunto, url, freq, periodo_inicio, periodo_fim, raw_json, fetched_at,
+                    municipality_locality_count, covers_national_municipalities
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     metadata.get("id"),
@@ -307,6 +325,8 @@ async def ingest_agregado(
                     metadata.get("periodicidade", {}).get("fim"),
                     _json_dumps(metadata),
                     fetched_at,
+                    municipality_locality_count,
+                    covers_national_munis,
                 ),
             )
 
@@ -315,12 +335,13 @@ async def ingest_agregado(
                 level_name = None
                 if locs:
                     level_name = locs[0].get("nivel", {}).get("nome")
+                locality_count = locality_counts.get((level_type, level_code), 0)
                 conn.execute(
                     """
-                    INSERT OR REPLACE INTO agregados_levels (agregado_id, level_id, level_name, level_type)
-                    VALUES (?, ?, ?, ?)
+                    INSERT OR REPLACE INTO agregados_levels (agregado_id, level_id, level_name, level_type, locality_count)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
-                    (agregado_id, level_code, level_name, level_type),
+                    (agregado_id, level_code, level_name, level_type, locality_count),
                 )
 
             conn.execute("DELETE FROM variables WHERE agregado_id = ?", (agregado_id,))

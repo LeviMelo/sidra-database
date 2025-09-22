@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from array import array
 from dataclasses import dataclass
-import from typing import Mapping, Sequence
+import math
+from typing import Mapping, Sequence
 
 from .db import sqlite_session
 from .embedding import EmbeddingClient
@@ -135,6 +136,17 @@ def _build_agregado_summary(row) -> tuple[str, str | None, dict[str, str]]:
             parts.append(f"Period {start or end}")
     if row["url"]:
         metadata["url"] = row["url"]
+    muni_count = row["municipality_locality_count"] if "municipality_locality_count" in row.keys() else None
+    if muni_count is not None and int(muni_count) > 0:
+        metadata["municipality_locality_count"] = str(int(muni_count))
+        parts.append(f"Municipalities: {int(muni_count):,}")
+    covers_national = (
+        row["covers_national_municipalities"] if "covers_national_municipalities" in row.keys() else None
+    )
+    if covers_national is not None:
+        metadata["covers_national_municipalities"] = str(int(covers_national))
+        if int(covers_national):
+            parts.append("National municipal coverage")
     description = " | ".join(filter(None, (part.strip() for part in parts))) or None
     return title, description, metadata
 
@@ -155,6 +167,12 @@ def _build_variable_summary(row) -> tuple[str, str | None, dict[str, str]]:
         metadata["unit"] = row["unidade"]
     if row["pesquisa"]:
         metadata["survey"] = row["pesquisa"]
+    if "municipality_locality_count" in row.keys() and int(row["municipality_locality_count"] or 0) > 0:
+        metadata["municipality_locality_count"] = str(int(row["municipality_locality_count"]))
+        parts.append(f"Municipalities: {int(row['municipality_locality_count']):,}")
+    if "covers_national_municipalities" in row.keys() and int(row["covers_national_municipalities"] or 0):
+        metadata["covers_national_municipalities"] = str(int(row["covers_national_municipalities"]))
+        parts.append("National municipal coverage")
     description = " | ".join(parts) or None
     return title, description, metadata
 
@@ -170,6 +188,10 @@ def _build_classification_summary(row) -> tuple[str, str | None, dict[str, str]]
     if row["agregado_nome"]:
         parts.append(f"Table {row['agregado_id']}: {row['agregado_nome']}")
         metadata["table_name"] = row["agregado_nome"]
+    if "municipality_locality_count" in row.keys() and int(row["municipality_locality_count"] or 0) > 0:
+        metadata["municipality_locality_count"] = str(int(row["municipality_locality_count"]))
+    if "covers_national_municipalities" in row.keys() and int(row["covers_national_municipalities"] or 0):
+        metadata["covers_national_municipalities"] = str(int(row["covers_national_municipalities"]))
     if row["sumarizacao_status"] is not None:
         metadata["summary_enabled"] = str(bool(row["sumarizacao_status"]))
         parts.append(f"Summarization: {'on' if row['sumarizacao_status'] else 'off'}")
@@ -192,6 +214,12 @@ def _build_category_summary(row) -> tuple[str, str | None, dict[str, str]]:
     if row["agregado_nome"]:
         parts.append(f"Table {row['agregado_id']}: {row['agregado_nome']}")
         metadata["table_name"] = row["agregado_nome"]
+    if "municipality_locality_count" in row.keys() and int(row["municipality_locality_count"] or 0) > 0:
+        metadata["municipality_locality_count"] = str(int(row["municipality_locality_count"]))
+        parts.append(f"Municipalities: {int(row['municipality_locality_count']):,}")
+    if "covers_national_municipalities" in row.keys() and int(row["covers_national_municipalities"] or 0):
+        metadata["covers_national_municipalities"] = str(int(row["covers_national_municipalities"]))
+        parts.append("National municipal coverage")
     if row["unidade"]:
         parts.append(f"Unit: {row['unidade']}")
         metadata["unit"] = row["unidade"]
@@ -206,7 +234,8 @@ def _enrich_match(conn, match: SemanticMatch) -> SemanticResult:
     if match.entity_type == "agregado" and match.agregado_id is not None:
         row = conn.execute(
             """
-            SELECT id, nome, pesquisa, assunto, url, freq, periodo_inicio, periodo_fim
+            SELECT id, nome, pesquisa, assunto, url, freq, periodo_inicio, periodo_fim,
+                   municipality_locality_count, covers_national_municipalities
             FROM agregados
             WHERE id = ?
             """,
@@ -222,7 +251,14 @@ def _enrich_match(conn, match: SemanticMatch) -> SemanticResult:
         if variable_id is not None:
             row = conn.execute(
                 """
-                SELECT v.id, v.nome, v.unidade, v.agregado_id, a.nome AS agregado_nome, a.pesquisa
+                SELECT v.id,
+                       v.nome,
+                       v.unidade,
+                       v.agregado_id,
+                       a.nome AS agregado_nome,
+                       a.pesquisa,
+                       a.covers_national_municipalities,
+                       a.municipality_locality_count
                 FROM variables v
                 JOIN agregados a ON a.id = v.agregado_id
                 WHERE v.agregado_id = ? AND v.id = ?
@@ -239,7 +275,13 @@ def _enrich_match(conn, match: SemanticMatch) -> SemanticResult:
         if classification_id is not None:
             row = conn.execute(
                 """
-                SELECT c.id, c.nome, c.agregado_id, c.sumarizacao_status, a.nome AS agregado_nome
+                SELECT c.id,
+                       c.nome,
+                       c.agregado_id,
+                       c.sumarizacao_status,
+                       a.nome AS agregado_nome,
+                       a.covers_national_municipalities,
+                       a.municipality_locality_count
                 FROM classifications c
                 JOIN agregados a ON a.id = c.agregado_id
                 WHERE c.agregado_id = ? AND c.id = ?
@@ -264,7 +306,9 @@ def _enrich_match(conn, match: SemanticMatch) -> SemanticResult:
                        cat.unidade,
                        cat.nivel,
                        cls.nome AS classification_nome,
-                       ag.nome AS agregado_nome
+                       ag.nome AS agregado_nome,
+                       ag.covers_national_municipalities,
+                       ag.municipality_locality_count
                 FROM categories cat
                 JOIN classifications cls
                   ON cls.agregado_id = cat.agregado_id AND cls.id = cat.classification_id

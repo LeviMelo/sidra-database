@@ -13,7 +13,9 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         periodo_inicio TEXT,
         periodo_fim TEXT,
         raw_json BLOB NOT NULL,
-        fetched_at TEXT NOT NULL
+        fetched_at TEXT NOT NULL,
+        municipality_locality_count INTEGER DEFAULT 0,
+        covers_national_municipalities INTEGER DEFAULT 0
     )
     """,
     """
@@ -22,6 +24,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         level_id TEXT NOT NULL,
         level_name TEXT,
         level_type TEXT NOT NULL,
+        locality_count INTEGER DEFAULT 0,
         PRIMARY KEY (agregado_id, level_id, level_type),
         FOREIGN KEY (agregado_id) REFERENCES agregados(id)
     )
@@ -118,12 +121,26 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
 )
 
+ADDITIONAL_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("agregados", "municipality_locality_count", "INTEGER DEFAULT 0"),
+    ("agregados", "covers_national_municipalities", "INTEGER DEFAULT 0"),
+    ("agregados_levels", "locality_count", "INTEGER DEFAULT 0"),
+)
+
+
+def _column_exists(connection, table: str, column: str) -> bool:
+    cursor = connection.execute(f"PRAGMA table_info({table})")
+    return any(row[1] == column for row in cursor.fetchall())
+
 
 def apply_schema(connection) -> None:
     """Execute schema statements on the provided SQLite connection."""
     cursor = connection.cursor()
     for stmt in SCHEMA_STATEMENTS:
         cursor.execute(stmt)
+    for table, column, definition in ADDITIONAL_COLUMNS:
+        if not _column_exists(connection, table, column):
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
     connection.commit()
 
 __all__ = ["SCHEMA_STATEMENTS", "apply_schema"]

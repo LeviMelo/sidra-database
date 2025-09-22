@@ -13,12 +13,15 @@
 - `periodo_fim` TEXT
 - `raw_json` BLOB NOT NULL  -- cached metadata payload
 - `fetched_at` TEXT NOT NULL  -- ISO timestamp
+- `municipality_locality_count` INTEGER DEFAULT 0  -- number of municipalities (N6) captured
+- `covers_national_municipalities` INTEGER DEFAULT 0  -- 1 when municipality coverage exceeds the configured threshold
 
 ### agregados_levels
 - `agregado_id` INTEGER REFERENCES agregados(id)
 - `level_id` TEXT NOT NULL  -- e.g. N1, N2
 - `level_name` TEXT
 - `level_type` TEXT NOT NULL  -- Administrativo/Especial/IBGE
+- `locality_count` INTEGER DEFAULT 0  -- number of localities returned for this level
 - PRIMARY KEY (`agregado_id`, `level_id`, `level_type`)
 
 ### variables
@@ -92,4 +95,5 @@
 - Store text hashes as SHA256 hex strings to trigger embedding refresh.
 - Keep raw metadata JSON in `agregados.raw_json` for auditing and replays.
 - Locality catalogs can be large; consider chunked insert with transactions.
+- Municipality coverage flags are derived from the locality counts (level `N6`) using a configurable threshold during ingestion.
 - Future extension: add `data_availability` summary table if we persist observation counts.
