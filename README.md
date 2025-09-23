@@ -5,9 +5,10 @@ Python toolkit for building a local SQLite metadata store and search layer for I
 ## Features
 - Asynchronous client for the aggregated-data v3 API.
 - SQLite schema and ingestion pipeline capturing tables, variables, classifications, periods, and localities.
-- LM Studio embedding client for local vector generation.
+- LM Studio embedding client for local vector generation (vectors stored only for agregados titles).
 - Coverage-aware catalog of agregados, including municipality counts and national coverage flags.
-- CLI helper to ingest, inspect, and semantically search agregados.
+- Hybrid search that blends agregados embeddings with lexical recall for variables, classifications, and categories.
+- CLI helper to ingest, inspect, and search the catalog.
 - Pytest, Ruff, and MyPy configuration for development.
 
 ## Quickstart
@@ -33,4 +34,13 @@ ruff check src tests
 mypy src
 ```
 
-Configuration values can be supplied via a simple JSON file (`sidra.config.json`) or environment variables. Copy `sidra.config.json.example` to `sidra.config.json` and adjust values as needed. The CLI search command will call the configured LM Studio embedding endpoint to embed the query and return enriched metadata for each match. Use the `list` subcommand to quickly surface agregados whose municipality coverage exceeds the configured national threshold (`SIDRA_MUNICIPALITY_NATIONAL_THRESHOLD`, default 4000).
+Configuration values can be supplied via a simple JSON file (`sidra.config.json`) or environment variables. Copy `sidra.config.json.example` to `sidra.config.json` and adjust values as needed. The CLI search command embeds the query once (agregados-only vectors) and blends the result with lexical matching so variables, classifications, and categories can surface even without dedicated embeddings. Use the `list` subcommand to quickly surface agregados whose municipality coverage exceeds the configured national threshold (`SIDRA_MUNICIPALITY_NATIONAL_THRESHOLD`, default 4000).
+
+## Hybrid Search Cheatsheet
+- `python -m sidra_database.cli search "esgoto saneamento"` — default hybrid mix of agregados plus lexical matches.
+- `python -m sidra_database.cli search "população urbana" --types variable` — return only variable-level hits discovered via lexical recall.
+- `python -m sidra_database.cli search "Tipo de emissário" --types classification --limit 10` — inspect classification metadata without embeddings.
+- Combine filters such as `--requires-national-munis`, `--min-municipalities 5000`, or `--period-start 2010` to restrict the agregados eligible for lexical expansion.
+- Because only agregados have stored vectors, use `--model` to switch embedding backends for table-level relevance; sub-entities will continue to rely on lexical scoring.
+
+Each result reports semantic, lexical, and combined scores. When the combined score is close to the lexical score, the item entered the ranking via the textual enrichment path.

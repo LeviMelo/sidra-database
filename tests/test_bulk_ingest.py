@@ -64,10 +64,31 @@ def test_ingest_by_coverage_skips_existing_and_records_failures(monkeypatch: pyt
 
     recorded: list[int] = []
 
-    async def fake_ingest(agregado_id: int, *, client=None, embedding_client=None):
+    async def fake_ingest(agregado_id: int, *, client=None, embedding_client=None, **_kwargs):
         if agregado_id == 30:
             raise RuntimeError("boom")
         recorded.append(agregado_id)
+        with sqlite_session() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO agregados (
+                    id, nome, pesquisa, assunto, url, freq, periodo_inicio, periodo_fim, raw_json, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    agregado_id,
+                    f"Table {agregado_id}",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    b"{}",
+                    "2024-01-01T00:00:00Z",
+                ),
+            )
+            conn.commit()
 
     monkeypatch.setattr(
         "sidra_database.bulk_ingest.discover_agregados_by_coverage",

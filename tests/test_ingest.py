@@ -118,10 +118,6 @@ def test_ingest_agregado_writes_metadata(monkeypatch: pytest.MonkeyPatch):
     client = FakeSidraClient()
     embedding_vectors = [
         (1.0, 0.0, 0.0),
-        (0.0, 1.0, 0.0),
-        (0.0, 0.0, 1.0),
-        (0.5, 0.5, 0.0),
-        (0.5, -0.5, 0.0),
     ]
     embedding_client = FakeEmbeddingClient(embedding_vectors)
 
@@ -172,16 +168,12 @@ def test_ingest_agregado_writes_metadata(monkeypatch: pytest.MonkeyPatch):
             ORDER BY entity_type, entity_id
             """
         ).fetchall()
-        assert len(embedding_rows) == 5
+        assert len(embedding_rows) == 1
         assert all(row["model"] == embedding_client.model for row in embedding_rows)
         assert all(row["agregado_id"] == 1234 for row in embedding_rows)
 
         expected = {
             ("agregado", "1234"): embedding_vectors[0],
-            ("variable", "1234:99"): embedding_vectors[1],
-            ("classification", "1234:1"): embedding_vectors[2],
-            ("category", "1234:1:0"): embedding_vectors[3],
-            ("category", "1234:1:4"): embedding_vectors[4],
         }
         for row in embedding_rows:
             key = (row["entity_type"], row["entity_id"])
@@ -191,9 +183,8 @@ def test_ingest_agregado_writes_metadata(monkeypatch: pytest.MonkeyPatch):
             assert len(unpacked) == row["dimension"]
             assert list(unpacked) == pytest.approx(expected[key])
 
-        assert len(embedding_client.calls) == 5
+        assert len(embedding_client.calls) == 1
         assert embedding_client.calls[0].startswith("Table 1234")
-        assert any("Classification 1" in call for call in embedding_client.calls)
     finally:
         conn.close()
 
@@ -212,7 +203,7 @@ def test_semantic_search_orders_results():
     try:
         conn.execute("DELETE FROM embeddings")
 
-        def insert(entity_type: str, entity_id: str, vector: Sequence[float], text_hash: str) -> None:
+        def insert(table_id: int, vector: Sequence[float], text_hash: str) -> None:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO embeddings (
@@ -220,9 +211,9 @@ def test_semantic_search_orders_results():
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    entity_type,
-                    entity_id,
-                    1234,
+                    "agregado",
+                    str(table_id),
+                    table_id,
                     text_hash,
                     "fake-model",
                     len(vector),
@@ -231,10 +222,9 @@ def test_semantic_search_orders_results():
                 ),
             )
 
-        insert("variable", "var_a", (1.0, 0.0), "h1")
-        insert("variable", "var_b", (0.5, 0.5), "h2")
-        insert("category", "cat_c", (0.0, 1.0), "h3")
-        insert("variable", "var_d", (-1.0, 0.0), "h4")
+        insert(100, (1.0, 0.0), "h1")
+        insert(200, (0.5, 0.5), "h2")
+        insert(300, (0.0, 1.0), "h3")
         conn.commit()
     finally:
         conn.close()
@@ -253,7 +243,7 @@ def test_semantic_search_orders_results():
 
     client = QueryEmbeddingClient()
     results = semantic_search("population", embedding_client=client, limit=3)
-    assert [item.entity_id for item in results] == ["var_a", "var_b", "cat_c"]
+    assert [item.entity_id for item in results] == ["100", "200", "300"]
     assert results[0].score == pytest.approx(1.0)
     assert results[1].score == pytest.approx(0.70710677, rel=1e-5)
     assert results[2].score == pytest.approx(0.0)
@@ -262,9 +252,9 @@ def test_semantic_search_orders_results():
         "population",
         embedding_client=client,
         limit=2,
-        entity_types=["variable"],
+        entity_types=["agregado"],
     )
-    assert [item.entity_id for item in filtered] == ["var_a", "var_b"]
+    assert [item.entity_id for item in filtered] == ["100", "200"]
 
 
 def test_semantic_search_with_metadata_enriches_results(monkeypatch: pytest.MonkeyPatch):
@@ -274,10 +264,6 @@ def test_semantic_search_with_metadata_enriches_results(monkeypatch: pytest.Monk
     client = FakeSidraClient()
     embedding_vectors = [
         (1.0, 0.0, 0.0),
-        (0.0, 1.0, 0.0),
-        (0.0, 0.0, 1.0),
-        (0.5, 0.5, 0.0),
-        (0.5, -0.5, 0.0),
     ]
     embedding_client = FakeEmbeddingClient(embedding_vectors)
     asyncio.run(ingest_agregado(1234, client=client, embedding_client=embedding_client))
@@ -313,18 +299,14 @@ def test_semantic_search_with_metadata_enriches_results(monkeypatch: pytest.Monk
         limit=3,
         embedding_client=QueryEmbeddingClient((0.0, 1.0, 0.0)),
     )
-    variable = next(item for item in variable_results if item.entity_type == "variable")
-    assert variable.metadata["unit"] == "Pessoas"
-    assert "Table 1234" in (variable.description or "")
+    assert [item for item in variable_results if item.entity_type == "variable"] == []
 
     classification_results = semantic_search_with_metadata(
         "classification",
         limit=3,
         embedding_client=QueryEmbeddingClient((0.0, 0.0, 1.0)),
     )
-    classification = next(item for item in classification_results if item.entity_type == "classification")
-    assert classification.metadata["classification_id"] == "1"
-    assert "Summarization" in (classification.description or "")
+    assert [item for item in classification_results if item.entity_type == "classification"] == []
 
 
 def test_list_agregados_filters(monkeypatch: pytest.MonkeyPatch):

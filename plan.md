@@ -25,12 +25,13 @@
 - CLI helper and development tooling (pytest, Ruff, MyPy).
 
 ## 4. Immediate Tasks
-1. Implement embedding persistence (store vectors in the embeddings table) and semantic search helpers.
-2. Add higher-level query layer (variable/category filters, semantic ranking).
-3. Provide notebooks or docs demonstrating ingestion + search workflow.
-4. Evaluate caching for large locality pulls and plan incremental updates.
+- ✅ Limit embeddings to agregados titles and skip variable/classification/category vectors during ingestion (completed September 2025).
+- ✅ Extend hybrid search so variables, classifications, and categories surface via lexical enrichment (completed September 2025).
+- ➡️ Add developer-facing docs/CLI examples that walk through the hybrid search workflow end-to-end.
+- 🔄 Evaluate caching for large locality pulls and outline an incremental refresh strategy.
 
 ## 5. Validation & Next Steps
+- Dashboard the search ranking (hit@k) for representative agregados/variable/classification/category queries.
 - Cross-check counts against legacy `.rds` exports to ensure coverage.
 - Extend ingestion to additional agregados as demographic requirements grow.
 - Plan optional value retrieval layer if future workflows need direct data pulls.
