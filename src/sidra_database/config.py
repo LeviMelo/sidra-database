@@ -43,6 +43,10 @@ class Settings(BaseSettings):
         default=4000,
         description="Minimum municipality count (N6) to flag national coverage.",
     )
+    database_timeout: float = Field(
+        default=30.0,
+        description="SQLite busy timeout (seconds) for concurrent writers.",
+    )
 
     model_config = SettingsConfigDict(
         env_prefix="SIDRA_",

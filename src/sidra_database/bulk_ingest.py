@@ -2,15 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import Any, Callable
 
 from .api_client import SidraApiClient
 from .db import ensure_schema, sqlite_session
 from .discovery import CatalogEntry, fetch_catalog_entries, filter_catalog_entries
 from .embedding import EmbeddingClient
-from .ingest import ingest_agregado
+from .ingest import ingest_agregado, generate_embeddings_for_agregado
 
 
 @dataclass(slots=True)
@@ -86,6 +87,8 @@ async def ingest_by_coverage(
     dry_run: bool = False,
     client: SidraApiClient | None = None,
     embedding_client: EmbeddingClient | None = None,
+    progress_callback: Callable[[str], None] | None = None,
+    generate_embeddings: bool = True,
 ) -> BulkIngestionReport:
     """Discover agregados using coverage filters and ingest them."""
 
@@ -93,6 +96,10 @@ async def ingest_by_coverage(
         raise ValueError("concurrency must be at least 1")
 
     ensure_schema()
+
+    def _emit(message: str) -> None:
+        if progress_callback is not None:
+            progress_callback(message)
 
     own_client = False
     if client is None:
@@ -127,25 +134,105 @@ async def ingest_by_coverage(
             to_schedule.append(entry.id)
         report.scheduled_ids = list(to_schedule)
 
+        total_to_schedule = len(to_schedule)
+        if total_to_schedule:
+            _emit(
+                f"Scheduling {total_to_schedule} agregados for ingestion "
+                f"with concurrency={concurrency}"
+            )
+        else:
+            _emit("No new agregados matched the requested filters.")
+
         if dry_run or not to_schedule:
             return report
 
         semaphore = asyncio.Semaphore(concurrency)
+        db_lock = asyncio.Lock() if concurrency > 1 else None
+
+        progress_step = max(1, total_to_schedule // 100) if total_to_schedule > 0 else 1
+        progress_time_budget = 15.0
+        last_progress_at = time.monotonic()
+        completed = 0
 
         async def _run(agregado_id: int) -> None:
+            nonlocal completed
+            nonlocal last_progress_at
             async with semaphore:
                 try:
                     await ingest_agregado(
                         agregado_id,
                         client=client,
                         embedding_client=embedding_client,
+                        generate_embeddings=False,
+                        db_lock=db_lock,
                     )
                 except Exception as exc:  # noqa: BLE001
                     report.failed.append((agregado_id, str(exc)))
+                    _emit(f"Failed agregado {agregado_id}: {exc}")
                 else:
                     report.ingested_ids.append(agregado_id)
+                finally:
+                    completed += 1
+                    now = time.monotonic()
+                    should_emit = (
+                        completed <= 10
+                        or completed == total_to_schedule
+                        or completed % progress_step == 0
+                        or (now - last_progress_at) >= progress_time_budget
+                    )
+                    if should_emit:
+                        last_progress_at = now
+                        ingested = len(report.ingested_ids)
+                        failed = len(report.failed)
+                        _emit(
+                            f"Progress {completed}/{total_to_schedule}: "
+                            f"ingested={ingested}, failed={failed}"
+                        )
 
         await asyncio.gather(*(_run(agregado_id) for agregado_id in to_schedule))
+
+        if generate_embeddings and report.ingested_ids:
+            embed_client = embedding_client or EmbeddingClient()
+            embed_lock = asyncio.Lock() if concurrency > 1 else None
+            embed_semaphore = asyncio.Semaphore(concurrency)
+            embed_total = len(report.ingested_ids)
+            embed_step = max(1, embed_total // 100) if embed_total > 0 else 1
+            embed_last_progress = time.monotonic()
+            completed_embeds = 0
+
+            async def _embed(agregado_id: int) -> None:
+                nonlocal completed_embeds
+                nonlocal embed_last_progress
+                async with embed_semaphore:
+                    try:
+                        await generate_embeddings_for_agregado(
+                            agregado_id,
+                            embedding_client=embed_client,
+                            db_lock=embed_lock,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        report.failed.append((agregado_id, f"embedding: {exc}"))
+                        _emit(f"Embedding failed for {agregado_id}: {exc}")
+                    finally:
+                        completed_embeds += 1
+                        now = time.monotonic()
+                        if (
+                            completed_embeds <= 10
+                            or completed_embeds == embed_total
+                            or completed_embeds % embed_step == 0
+                            or (now - embed_last_progress) >= progress_time_budget
+                        ):
+                            embed_last_progress = now
+                            _emit(
+                                f"Embedding progress {completed_embeds}/{embed_total}"
+                            )
+
+            _emit(
+                f"Generating embeddings for {len(report.ingested_ids)} agregados"
+            )
+            await asyncio.gather(
+                *(_embed(agregado_id) for agregado_id in report.ingested_ids)
+            )
         return report
     finally:
         if own_client:

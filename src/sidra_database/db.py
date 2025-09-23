@@ -16,9 +16,11 @@ def get_database_path() -> Path:
 
 
 def create_connection() -> sqlite3.Connection:
+    settings = get_settings()
     path = get_database_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(path, timeout=settings.database_timeout)
+    connection.execute("PRAGMA journal_mode=WAL")
     connection.row_factory = sqlite3.Row
     return connection
 

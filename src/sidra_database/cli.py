@@ -3,14 +3,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import time
 from typing import Sequence
 
 from .config import get_settings
 from .embedding import EmbeddingClient
-from .ingest import ingest_agregado
+from .ingest import ingest_agregado, generate_embeddings_for_agregado
 from .bulk_ingest import ingest_by_coverage
-from .search import semantic_search_with_metadata
+from .search import hybrid_search, SearchFilters
 from .catalog import list_agregados
+from .db import sqlite_session, ensure_schema
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -30,6 +32,35 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=4,
         help="Number of concurrent ingestion tasks (default: 4)",
+    )
+    ingest_parser.add_argument(
+        "--skip-embeddings",
+        action="store_true",
+        help="Skip embedding generation during ingestion",
+    )
+
+    embed_parser = subparsers.add_parser(
+        "embed",
+        help="Regenerate embeddings for stored agregados",
+    )
+    embed_parser.add_argument(
+        "agregado_ids",
+        metavar="AGREGADO",
+        type=int,
+        nargs="*",
+        help="Optional list of agregados IDs to embed (default: all stored)",
+    )
+    embed_parser.add_argument(
+        "--concurrent",
+        type=int,
+        default=6,
+        help="Number of concurrent embedding tasks (default: 6)",
+    )
+    embed_parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Override embedding model identifier for LM Studio",
     )
 
     bulk_parser = subparsers.add_parser(
@@ -96,6 +127,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reingest agregados already present in the database",
     )
     bulk_parser.set_defaults(skip_existing=True)
+    bulk_parser.add_argument(
+        "--skip-embeddings",
+        action="store_true",
+        help="Skip embedding generation during ingestion",
+    )
 
     search_parser = subparsers.add_parser("search", help="Run semantic search over stored embeddings")
     search_parser.add_argument("query", help="Search query text")
@@ -116,6 +152,41 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Override embedding model identifier",
+    )
+    search_parser.add_argument(
+        "--min-municipalities",
+        type=int,
+        default=None,
+        help="Only return agregados covering at least this many municipalities",
+    )
+    search_parser.add_argument(
+        "--requires-national-munis",
+        action="store_true",
+        help="Only return agregados flagged with national municipal coverage",
+    )
+    search_parser.add_argument(
+        "--subject-contains",
+        type=str,
+        default=None,
+        help="Filter agregados whose subject contains this text",
+    )
+    search_parser.add_argument(
+        "--survey-contains",
+        type=str,
+        default=None,
+        help="Filter agregados whose survey contains this text",
+    )
+    search_parser.add_argument(
+        "--period-start",
+        type=int,
+        default=None,
+        help="Require tables with period end >= this year",
+    )
+    search_parser.add_argument(
+        "--period-end",
+        type=int,
+        default=None,
+        help="Require tables with period start <= this year",
     )
 
     list_parser = subparsers.add_parser("list", help="List stored agregados with optional coverage filters")
@@ -146,14 +217,80 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _run_ids(agregado_ids: Sequence[int], concurrency: int) -> None:
+async def _run_ids(
+    agregado_ids: Sequence[int],
+    concurrency: int,
+    *,
+    generate_embeddings: bool,
+) -> None:
     semaphore = asyncio.Semaphore(concurrency)
 
     async def worker(agregado_id: int) -> None:
         async with semaphore:
-            await ingest_agregado(agregado_id)
+            await ingest_agregado(agregado_id, generate_embeddings=generate_embeddings)
 
     await asyncio.gather(*(worker(agregado_id) for agregado_id in agregado_ids))
+
+
+async def _embed_ids(
+    agregado_ids: Sequence[int],
+    concurrency: int,
+    *,
+    model: str | None = None,
+) -> None:
+    if concurrency < 1:
+        raise ValueError("concurrency must be at least 1")
+
+    semaphore = asyncio.Semaphore(concurrency)
+    progress_lock = asyncio.Lock()
+    db_lock = asyncio.Lock()
+
+    embed_client = EmbeddingClient(model=model) if model else EmbeddingClient()
+
+    total = len(agregado_ids)
+    completed = 0
+    failed: list[tuple[int, str]] = []
+    progress_step = max(1, total // 100) if total else 1
+    last_emit = time.monotonic()
+    emit_interval = 15.0
+
+    async def worker(agregado_id: int) -> None:
+        nonlocal completed, last_emit
+        async with semaphore:
+            try:
+                await generate_embeddings_for_agregado(
+                    agregado_id,
+                    embedding_client=embed_client,
+                    db_lock=db_lock,
+                )
+            except Exception as exc:  # noqa: BLE001
+                async with progress_lock:
+                    failed.append((agregado_id, str(exc)))
+            finally:
+                async with progress_lock:
+                    completed += 1
+                    now = time.monotonic()
+                    should_emit = (
+                        completed <= 10
+                        or completed == total
+                        or completed % progress_step == 0
+                        or (now - last_emit) >= emit_interval
+                    )
+                    if should_emit:
+                        last_emit = now
+                        print(
+                            f"Embedding progress {completed}/{total}: failed={len(failed)}",
+                            flush=True,
+                        )
+
+    await asyncio.gather(*(worker(agregado_id) for agregado_id in agregado_ids))
+
+    if failed:
+        print("Embedding failures:")
+        for agregado_id, message in failed[:10]:
+            print(f"   {agregado_id}: {message[:180]}")
+        if len(failed) > 10:
+            print("   ...")
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -163,11 +300,26 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(f"Using database at {settings.database_path}")
 
     if args.command == "ingest":
-        asyncio.run(_run_ids(args.agregado_ids, args.concurrent))
+        if args.skip_embeddings:
+            print("Embedding generation skipped; metadata only.")
+        asyncio.run(
+            _run_ids(
+                args.agregado_ids,
+                args.concurrent,
+                generate_embeddings=not args.skip_embeddings,
+            )
+        )
         return
 
     if args.command == "ingest-coverage":
         any_levels = args.any_levels or ["N3", "N6"]
+
+        if args.skip_embeddings:
+            print("Embedding generation skipped; metadata only.")
+
+        def _progress(message: str) -> None:
+            print(message, flush=True)
+
         report = asyncio.run(
             ingest_by_coverage(
                 require_any_levels=any_levels,
@@ -179,6 +331,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 concurrency=args.concurrent,
                 skip_existing=args.skip_existing,
                 dry_run=args.dry_run,
+                generate_embeddings=not args.skip_embeddings,
+                progress_callback=_progress,
             )
         )
         discovered = len(report.discovered_ids)
@@ -205,12 +359,45 @@ def main(argv: Sequence[str] | None = None) -> None:
                 print("   ...")
         return
 
+    if args.command == "embed":
+        ensure_schema()
+        if args.agregado_ids:
+            ids = list(dict.fromkeys(args.agregado_ids))
+        else:
+            with sqlite_session() as conn:
+                rows = conn.execute("SELECT id FROM agregados ORDER BY id").fetchall()
+                ids = [int(row["id"]) for row in rows]
+
+        if not ids:
+            print("No agregados available for embedding.")
+            return
+
+        print(f"Embedding {len(ids)} agregados with concurrency={args.concurrent}")
+        asyncio.run(
+            _embed_ids(
+                ids,
+                args.concurrent,
+                model=args.model,
+            )
+        )
+        return
+
     if args.command == "search":
+        filters = SearchFilters(
+            min_municipalities=args.min_municipalities,
+            requires_national_munis=args.requires_national_munis,
+            subject_contains=args.subject_contains,
+            survey_contains=args.survey_contains,
+            period_start=args.period_start,
+            period_end=args.period_end,
+        )
+
         client = EmbeddingClient(model=args.model) if args.model else EmbeddingClient()
-        results = semantic_search_with_metadata(
+        results = hybrid_search(
             args.query,
             entity_types=args.types,
             limit=args.limit,
+            filters=filters,
             embedding_client=client,
             model=args.model,
         )
@@ -218,12 +405,33 @@ def main(argv: Sequence[str] | None = None) -> None:
             print("No results found.")
             return
         for index, item in enumerate(results, start=1):
-            score = f"{item.score:.3f}" if item.score else "0.000"
-            header = f"{index}. [{item.entity_type}] score={score} table={item.agregado_id}"
+            score = f"{item.combined_score:.3f}"
+            semantic = f"{item.score:.3f}"
+            lexical = f"{item.lexical_score:.3f}"
+            header = (
+                f"{index}. [{item.entity_type}] score={score} "
+                f"(semantic={semantic}, lexical={lexical})"
+            )
+            if item.agregado_id is not None:
+                header += f" table={item.agregado_id}"
             print(header)
             print(f"   {item.title}")
             if item.description:
                 print(f"   {item.description}")
+            variables_sample = item.metadata.get("variables_sample") if isinstance(item.metadata, dict) else None
+            if variables_sample:
+                count = item.metadata.get("variables_count")
+                suffix = f" (total {count})" if count else ""
+                print(f"   Variables: {variables_sample}{suffix}")
+            classifications_sample = (
+                item.metadata.get("classifications_sample")
+                if isinstance(item.metadata, dict)
+                else None
+            )
+            if classifications_sample:
+                count = item.metadata.get("classifications_count")
+                suffix = f" (total {count})" if count else ""
+                print(f"   Classifications: {classifications_sample}{suffix}")
         return
 
     if args.command == "list":

@@ -14,8 +14,10 @@ from .discovery import CatalogEntry
 from .search import (
     SemanticMatch,
     SemanticResult,
+    SearchFilters,
     semantic_search,
     semantic_search_with_metadata,
+    hybrid_search,
 )
 
 __all__ = [
@@ -38,8 +40,10 @@ __all__ = [
     "ingest_by_coverage",
     "SemanticMatch",
     "SemanticResult",
+    "SearchFilters",
     "semantic_search",
     "semantic_search_with_metadata",
+    "hybrid_search",
 ]
 
 
