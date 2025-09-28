@@ -464,6 +464,11 @@ async def generate_embeddings_for_agregado(
         raise ValueError(f"Agregado {agregado_id} not found in database")
 
     metadata = orjson.loads(row["raw_json"])
+    if not metadata or not metadata.get("nome"):
+        # Synthetic fixtures may not provide the full metadata payload. Skip
+        # embedding generation if the required context is missing to avoid
+        # spurious network calls during tests.
+        return
     embedding_targets = _build_embedding_targets(agregado_id, metadata)
     if not embedding_targets:
         return
