@@ -11,6 +11,7 @@ from sidra_database import (
     ensure_schema,
     get_database_path,
     ingest_agregado,
+    hybrid_search,
     semantic_search,
     semantic_search_with_metadata,
     list_agregados,
@@ -307,6 +308,151 @@ def test_semantic_search_with_metadata_enriches_results(monkeypatch: pytest.Monk
         embedding_client=QueryEmbeddingClient((0.0, 0.0, 1.0)),
     )
     assert [item for item in classification_results if item.entity_type == "classification"] == []
+
+
+def test_hybrid_search_surface_child_evidence():
+    ensure_schema()
+    conn = create_connection()
+    try:
+        for table in [
+            "embeddings",
+            "categories",
+            "classifications",
+            "variables",
+            "agregados_levels",
+            "agregados",
+        ]:
+            conn.execute(f"DELETE FROM {table}")
+
+        conn.execute(
+            """
+            INSERT INTO agregados (
+                id, nome, pesquisa, assunto, url, freq, periodo_inicio, periodo_fim, raw_json,
+                fetched_at, municipality_locality_count, covers_national_municipalities
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                4321,
+                "Indicadores demograficos",
+                "Pesquisa demografica",
+                "Demografia",
+                "https://sidra.ibge.gov.br/tabela/4321",
+                "anual",
+                "2010",
+                "2020",
+                b"{}",
+                "2024-01-01T00:00:00Z",
+                5570,
+                1,
+            ),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO variables (id, agregado_id, nome, unidade, sumarizacao, text_hash)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                1001,
+                4321,
+                "Populacao total",
+                "habitantes",
+                "[]",
+                "hash-variable",
+            ),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO classifications (id, agregado_id, nome, sumarizacao_status, sumarizacao_excecao)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                55,
+                4321,
+                "Faixa etaria",
+                1,
+                "[]",
+            ),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO categories (
+                agregado_id, classification_id, categoria_id, nome, unidade, nivel, text_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                4321,
+                55,
+                7,
+                "Faixa etaria 18-24",
+                None,
+                1,
+                "hash-category",
+            ),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO embeddings (
+                entity_type, entity_id, agregado_id, text_hash, model, dimension, vector, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "agregado",
+                "4321",
+                4321,
+                "hash-agg",
+                "fake-model",
+                2,
+                array("f", (1.0, 0.0)).tobytes(),
+                "2024-01-01T00:00:00Z",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    class QueryEmbeddingClient:
+        def __init__(self) -> None:
+            self._model = "fake-model"
+
+        @property
+        def model(self) -> str:
+            return self._model
+
+        def embed_text(self, text: str, *, model: str | None = None) -> list[float]:
+            if model is not None:
+                assert model == self._model
+            return [1.0, 0.0]
+
+    client = QueryEmbeddingClient()
+
+    results = hybrid_search(
+        "faixa etaria",
+        embedding_client=client,
+        child_types=["classification", "category"],
+        max_child_matches=4,
+        limit=3,
+    )
+    assert results
+    top = results[0]
+    assert top.agregado_id == 4321
+    assert top.lexical_children_score > 0
+    assert any("Faixa etaria" in match.title for match in top.child_matches)
+    assert all(match.entity_type in {"classification", "category"} for match in top.child_matches)
+
+    no_children = hybrid_search(
+        "faixa etaria",
+        embedding_client=client,
+        child_types=[],
+        max_child_matches=4,
+        limit=1,
+    )
+    assert no_children
+    assert no_children[0].agregado_id == 4321
+    assert no_children[0].lexical_children_score == 0
 
 
 def test_list_agregados_filters(monkeypatch: pytest.MonkeyPatch):

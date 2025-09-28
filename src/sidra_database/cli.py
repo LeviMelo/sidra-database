@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import time
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from .config import get_settings
 from .embedding import EmbeddingClient
@@ -139,7 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--types",
         nargs="*",
         choices=["agregado", "variable", "classification", "category"],
-        help="Optional entity types to filter",
+        help="Child entity types that may contribute lexical evidence",
     )
     search_parser.add_argument(
         "--limit",
@@ -152,6 +153,28 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Override embedding model identifier",
+    )
+    search_parser.add_argument(
+        "--expand",
+        type=int,
+        default=6,
+        help="Maximum number of child matches to show per table (default: 6)",
+    )
+    search_parser.add_argument(
+        "--flat",
+        action="store_true",
+        help="Print child matches as a flat list instead of per table",
+    )
+    search_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Return results as JSON",
+    )
+    search_parser.add_argument(
+        "--weights",
+        type=str,
+        default=None,
+        help="Override scoring weights, e.g. sem=0.6,lex_table=0.2,lex_children=0.2",
     )
     search_parser.add_argument(
         "--min-municipalities",
@@ -187,6 +210,30 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Require tables with period start <= this year",
+    )
+    search_parser.add_argument(
+        "--has-variable",
+        dest="has_variables",
+        type=int,
+        action="append",
+        default=None,
+        help="Only return tables containing this variable ID (repeatable)",
+    )
+    search_parser.add_argument(
+        "--has-classification",
+        dest="has_classifications",
+        type=int,
+        action="append",
+        default=None,
+        help="Only return tables containing this classification ID (repeatable)",
+    )
+    search_parser.add_argument(
+        "--has-category",
+        dest="has_categories",
+        type=str,
+        action="append",
+        default=None,
+        help="Only return tables containing classification:category pairs",
     )
 
     list_parser = subparsers.add_parser("list", help="List stored agregados with optional coverage filters")
@@ -293,6 +340,51 @@ async def _embed_ids(
             print("   ...")
 
 
+def _parse_weight_overrides(spec: str | None) -> Mapping[str, float] | None:
+    if spec is None:
+        return None
+    overrides: dict[str, float] = {}
+    for part in spec.split(","):
+        chunk = part.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            raise ValueError(
+                f"Invalid weight override '{chunk}'. Expected format key=value, e.g. sem=0.6."
+            )
+        key, value = chunk.split("=", 1)
+        key = key.strip()
+        try:
+            overrides[key] = float(value.strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid numeric weight for '{key}': {value.strip()}"
+            ) from exc
+    return overrides
+
+
+def _parse_category_filters(raw: Sequence[str] | None) -> list[tuple[int, int]]:
+    if not raw:
+        return []
+    parsed: list[tuple[int, int]] = []
+    for value in raw:
+        chunk = value.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            raise ValueError(
+                f"Invalid category filter '{value}'. Expected CLASSIFICATION:CATEGORY format."
+            )
+        left, right = chunk.split(":", 1)
+        try:
+            parsed.append((int(left), int(right)))
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid category filter '{value}'. Both parts must be integers."
+            ) from exc
+    return parsed
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -383,6 +475,20 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     if args.command == "search":
+        try:
+            weight_overrides = _parse_weight_overrides(args.weights)
+        except ValueError as exc:
+            parser.error(str(exc))
+
+        try:
+            category_filters = _parse_category_filters(args.has_categories)
+        except ValueError as exc:
+            parser.error(str(exc))
+
+        has_variables = args.has_variables or None
+        has_classifications = args.has_classifications or None
+        has_categories = category_filters or None
+
         filters = SearchFilters(
             min_municipalities=args.min_municipalities,
             requires_national_munis=args.requires_national_munis,
@@ -390,48 +496,157 @@ def main(argv: Sequence[str] | None = None) -> None:
             survey_contains=args.survey_contains,
             period_start=args.period_start,
             period_end=args.period_end,
+            has_variables=has_variables,
+            has_classifications=has_classifications,
+            has_categories=has_categories,
         )
+
+        allowed_children = ["variable", "classification", "category"]
+        if args.types:
+            requested = {item.lower() for item in args.types}
+            child_types = [child for child in allowed_children if child in requested]
+        else:
+            child_types = allowed_children
+
+        expand = max(0, args.expand)
 
         client = EmbeddingClient(model=args.model) if args.model else EmbeddingClient()
         results = hybrid_search(
             args.query,
-            entity_types=args.types,
             limit=args.limit,
             filters=filters,
             embedding_client=client,
             model=args.model,
+            child_types=child_types,
+            max_child_matches=expand,
+            weights=weight_overrides,
         )
         if not results:
             print("No results found.")
             return
+        if args.json:
+            payload = []
+            for item in results:
+                metadata = dict(item.metadata)
+                children: list[dict[str, object]] = []
+                for child in item.child_matches:
+                    child_meta = dict(child.metadata)
+                    children.append(
+                        {
+                            "type": child.entity_type,
+                            "id": child.entity_id,
+                            "title": child.title,
+                            "lexical_score": child.lexical_score,
+                            "metadata": child_meta,
+                        }
+                    )
+                payload.append(
+                    {
+                        "table_id": item.agregado_id,
+                        "title": item.title,
+                        "description": item.description,
+                        "scores": {
+                            "combined": item.combined_score,
+                            "semantic": item.score,
+                            "lexical_table": item.lexical_table_score,
+                            "lexical_children": item.lexical_children_score,
+                        },
+                        "metadata": metadata,
+                        "children": children,
+                    }
+                )
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return
+
+        if args.flat:
+            for item in results:
+                base = f"{item.agregado_id}: {item.title}"
+                if not item.child_matches:
+                    print(f"{base} [score={item.combined_score:.3f}]")
+                    continue
+                for child in item.child_matches:
+                    child_meta = dict(child.metadata)
+                    details: list[str] = []
+                    unit = child_meta.get("unit")
+                    if unit:
+                        details.append(f"unit={unit}")
+                    classification_id = child_meta.get("classification_id")
+                    if classification_id:
+                        details.append(f"classification={classification_id}")
+                    detail_text = f" ({', '.join(details)})" if details else ""
+                    print(
+                        f"{item.agregado_id}: [{child.entity_type}] {child.title}{detail_text} "
+                        f"lex={child.lexical_score:.3f}"
+                    )
+            return
+
         for index, item in enumerate(results, start=1):
-            score = f"{item.combined_score:.3f}"
-            semantic = f"{item.score:.3f}"
-            lexical = f"{item.lexical_score:.3f}"
-            header = (
-                f"{index}. [{item.entity_type}] score={score} "
-                f"(semantic={semantic}, lexical={lexical})"
+            metadata = dict(item.metadata)
+            score_line = (
+                f"{index}. table={item.agregado_id} "
+                f"score={item.combined_score:.3f} "
+                f"(sem={item.score:.3f} | lex_table={item.lexical_table_score:.3f} | "
+                f"lex_children={item.lexical_children_score:.3f})"
             )
-            if item.agregado_id is not None:
-                header += f" table={item.agregado_id}"
-            print(header)
+            print(score_line)
             print(f"   {item.title}")
             if item.description:
                 print(f"   {item.description}")
-            variables_sample = item.metadata.get("variables_sample") if isinstance(item.metadata, dict) else None
-            if variables_sample:
-                count = item.metadata.get("variables_count")
-                suffix = f" (total {count})" if count else ""
-                print(f"   Variables: {variables_sample}{suffix}")
-            classifications_sample = (
-                item.metadata.get("classifications_sample")
-                if isinstance(item.metadata, dict)
-                else None
-            )
-            if classifications_sample:
-                count = item.metadata.get("classifications_count")
-                suffix = f" (total {count})" if count else ""
-                print(f"   Classifications: {classifications_sample}{suffix}")
+
+            subject = metadata.get("subject")
+            survey = metadata.get("survey")
+            period_start = metadata.get("period_start")
+            period_end = metadata.get("period_end")
+            muni_count = metadata.get("municipality_locality_count")
+            covers_national = metadata.get("covers_national_municipalities")
+            url = metadata.get("url")
+            levels_sample = metadata.get("levels_sample")
+            levels_count = metadata.get("levels_count")
+
+            info_parts: list[str] = []
+            if survey:
+                info_parts.append(f"Survey: {survey}")
+            if subject:
+                info_parts.append(f"Subject: {subject}")
+            if period_start or period_end:
+                if period_start and period_end and period_start != period_end:
+                    info_parts.append(f"Period {period_start}-{period_end}")
+                else:
+                    info_parts.append(f"Period {period_start or period_end}")
+            if muni_count:
+                try:
+                    formatted = f"{int(muni_count):,}"
+                except ValueError:
+                    formatted = muni_count
+                coverage = f"Municipalities: {formatted}"
+                if covers_national in {"1", "True", "true", "yes"}:
+                    coverage += " (national)"
+                info_parts.append(coverage)
+            if levels_sample:
+                suffix = f" (total {levels_count})" if levels_count else ""
+                info_parts.append(f"Levels: {levels_sample}{suffix}")
+            if url:
+                info_parts.append(f"URL: {url}")
+            if info_parts:
+                print(f"   {' | '.join(info_parts)}")
+
+            if item.child_matches:
+                print("   Why it matched:")
+                for child in item.child_matches:
+                    child_meta = dict(child.metadata)
+                    details: list[str] = []
+                    unit = child_meta.get("unit")
+                    if unit:
+                        details.append(f"unit={unit}")
+                    classification_id = child_meta.get("classification_id")
+                    if classification_id:
+                        details.append(f"classification={classification_id}")
+                    detail_text = f" ({', '.join(details)})" if details else ""
+                    print(
+                        f"      - [{child.entity_type}] {child.title}{detail_text} "
+                        f"lex={child.lexical_score:.3f}"
+                    )
+            print()
         return
 
     if args.command == "list":

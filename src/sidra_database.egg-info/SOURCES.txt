@@ -2,10 +2,12 @@ README.md
 pyproject.toml
 src/sidra_database/__init__.py
 src/sidra_database/api_client.py
+src/sidra_database/bulk_ingest.py
 src/sidra_database/catalog.py
 src/sidra_database/cli.py
 src/sidra_database/config.py
 src/sidra_database/db.py
+src/sidra_database/discovery.py
 src/sidra_database/embedding.py
 src/sidra_database/ingest.py
 src/sidra_database/schema.py
@@ -15,4 +17,5 @@ src/sidra_database.egg-info/SOURCES.txt
 src/sidra_database.egg-info/dependency_links.txt
 src/sidra_database.egg-info/requires.txt
 src/sidra_database.egg-info/top_level.txt
+tests/test_bulk_ingest.py
 tests/test_ingest.py

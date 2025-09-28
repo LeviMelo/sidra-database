@@ -5,6 +5,7 @@ from array import array
 from dataclasses import dataclass, replace
 import math
 import re
+import unicodedata
 from typing import Mapping, Sequence
 
 from .db import sqlite_session
@@ -36,6 +37,9 @@ class SemanticResult:
     metadata: Mapping[str, str]
     lexical_score: float = 0.0
     combined_score: float = 0.0
+    lexical_table_score: float = 0.0
+    lexical_children_score: float = 0.0
+    child_matches: Sequence["ChildMatch"] = ()
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,20 @@ class SearchFilters:
     survey_contains: str | None = None
     period_start: int | None = None
     period_end: int | None = None
+    has_variables: Sequence[int] | None = None
+    has_classifications: Sequence[int] | None = None
+    has_categories: Sequence[tuple[int, int]] | None = None
+
+
+@dataclass(frozen=True)
+class ChildMatch:
+    """Lexical evidence from child entities used to justify a table hit."""
+
+    entity_type: str
+    entity_id: str
+    title: str
+    lexical_score: float
+    metadata: Mapping[str, str]
 
 
 def _decode_vector(blob: bytes, dimension: int) -> list[float]:
@@ -72,9 +90,15 @@ def _cosine_similarity(query: Sequence[float], candidate: Sequence[float], query
     return dot / (query_norm * candidate_norm)
 
 
+def _strip_accents(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    return "".join(ch for ch in normalized if ord(ch) < 128)
+
+
 def _tokenize(text: str) -> list[str]:
-    tokens = [token.lower() for token in re.findall(r"\w+", text)]
-    return [token for token in tokens if len(token) >= 3]
+    folded = _strip_accents(text.lower())
+    tokens = [token for token in re.findall(r"\w+", folded) if len(token) >= 3]
+    return tokens
 
 
 def _normalize_substring(value: str | None) -> str:
@@ -135,32 +159,55 @@ def semantic_search(
     return matches[:limit]
 
 
-def _filters_to_sql(filters: SearchFilters | None) -> tuple[list[str], list[object]]:
+def _filters_to_sql(
+    filters: SearchFilters | None,
+    *,
+    table_alias: str | None = None,
+) -> tuple[list[str], list[object]]:
     if filters is None:
         return [], []
     conditions: list[str] = []
     params: list[object] = []
+    prefix = f"{table_alias}." if table_alias else ""
+    id_ref = f"{table_alias}.id" if table_alias else "id"
     if filters.min_municipalities is not None:
-        conditions.append("municipality_locality_count >= ?")
+        conditions.append(f"{prefix}municipality_locality_count >= ?")
         params.append(int(filters.min_municipalities))
     if filters.requires_national_munis:
-        conditions.append("covers_national_municipalities = 1")
+        conditions.append(f"{prefix}covers_national_municipalities = 1")
     if filters.subject_contains:
-        conditions.append("LOWER(assunto) LIKE ?")
+        conditions.append(f"LOWER({prefix}assunto) LIKE ?")
         params.append(f"%{filters.subject_contains.lower()}%")
     if filters.survey_contains:
-        conditions.append("LOWER(pesquisa) LIKE ?")
+        conditions.append(f"LOWER({prefix}pesquisa) LIKE ?")
         params.append(f"%{filters.survey_contains.lower()}%")
     if filters.period_start is not None:
         conditions.append(
-            "(periodo_fim IS NULL OR CAST(periodo_fim AS INTEGER) >= ?)"
+            f"({prefix}periodo_fim IS NULL OR CAST({prefix}periodo_fim AS INTEGER) >= ?)"
         )
         params.append(int(filters.period_start))
     if filters.period_end is not None:
         conditions.append(
-            "(periodo_inicio IS NULL OR CAST(periodo_inicio AS INTEGER) <= ?)"
+            f"({prefix}periodo_inicio IS NULL OR CAST({prefix}periodo_inicio AS INTEGER) <= ?)"
         )
         params.append(int(filters.period_end))
+    for variable_id in filters.has_variables or ():
+        conditions.append(
+            f"EXISTS (SELECT 1 FROM variables v WHERE v.agregado_id = {id_ref} AND v.id = ?)"
+        )
+        params.append(int(variable_id))
+    for classification_id in filters.has_classifications or ():
+        conditions.append(
+            f"EXISTS (SELECT 1 FROM classifications c WHERE c.agregado_id = {id_ref} AND c.id = ?)"
+        )
+        params.append(int(classification_id))
+    for category in filters.has_categories or ():
+        classification_id, category_id = category
+        conditions.append(
+            "EXISTS (SELECT 1 FROM categories cat WHERE cat.agregado_id = {id_ref} "
+            "AND cat.classification_id = ? AND cat.categoria_id = ?)".format(id_ref=id_ref)
+        )
+        params.extend([int(classification_id), int(category_id)])
     return conditions, params
 
 
@@ -173,12 +220,12 @@ def _lexical_candidates(
     if not tokens or limit <= 0:
         return []
 
-    conditions, params = _filters_to_sql(filters)
+    conditions, params = _filters_to_sql(filters, table_alias="a")
     token_clauses: list[str] = []
     for token in tokens:
         pattern = f"%{token}%"
         token_clauses.append(
-            "(LOWER(nome) LIKE ? OR LOWER(pesquisa) LIKE ? OR LOWER(assunto) LIKE ?)"
+            "(LOWER(a.nome) LIKE ? OR LOWER(a.pesquisa) LIKE ? OR LOWER(a.assunto) LIKE ?)"
         )
         params.extend([pattern, pattern, pattern])
 
@@ -186,7 +233,7 @@ def _lexical_candidates(
     if token_clauses:
         where_parts.append(" AND ".join(token_clauses))
 
-    sql = "SELECT id, nome, pesquisa, assunto FROM agregados"
+    sql = "SELECT a.id, a.nome, a.pesquisa, a.assunto FROM agregados a"
     if where_parts:
         sql += " WHERE " + " AND ".join(where_parts)
     sql += " LIMIT ?"
@@ -229,6 +276,188 @@ def _combine_scores(semantic_score: float, lexical_score: float) -> float:
     if lexical_score <= 0:
         return semantic_score
     return 0.65 * semantic_score + 0.35 * lexical_score
+
+
+DEFAULT_WEIGHTS: Mapping[str, float] = {
+    "sem": 0.62,
+    "lex_table": 0.18,
+    "lex_children": 0.20,
+}
+
+
+def _resolve_weights(overrides: Mapping[str, float] | None) -> Mapping[str, float]:
+    if not overrides:
+        return DEFAULT_WEIGHTS
+    merged = dict(DEFAULT_WEIGHTS)
+    for key, value in overrides.items():
+        if key in merged and value >= 0:
+            merged[key] = float(value)
+    return merged
+
+
+def _lexical_children(
+    conn,
+    tokens: Sequence[str],
+    filters: SearchFilters | None,
+    limit: int,
+    child_types: Sequence[str],
+) -> list[tuple[int, ChildMatch]]:
+    if not tokens or not child_types or limit <= 0:
+        return []
+
+    overfetch = max(limit, 50)
+    results: list[tuple[int, ChildMatch]] = []
+    normalized_types = [child.lower() for child in child_types]
+
+    if "variable" in normalized_types:
+        results.extend(
+            _lexical_child_query(
+                conn,
+                tokens,
+                filters,
+                overfetch,
+                sql="""
+                    SELECT v.agregado_id AS table_id,
+                           v.id AS child_id,
+                           v.nome,
+                           v.unidade,
+                           NULL AS classification_id,
+                           NULL AS category_id
+                    FROM variables v
+                    JOIN agregados a ON a.id = v.agregado_id
+                """,
+                fields=["v.nome", "v.unidade"],
+                entity_type="variable",
+            )
+        )
+
+    if "classification" in normalized_types:
+        results.extend(
+            _lexical_child_query(
+                conn,
+                tokens,
+                filters,
+                overfetch,
+                sql="""
+                    SELECT c.agregado_id AS table_id,
+                           c.id AS child_id,
+                           c.nome,
+                           NULL AS unidade,
+                           NULL AS classification_id,
+                           NULL AS category_id
+                    FROM classifications c
+                    JOIN agregados a ON a.id = c.agregado_id
+                """,
+                fields=["c.nome"],
+                entity_type="classification",
+            )
+        )
+
+    if "category" in normalized_types:
+        results.extend(
+            _lexical_child_query(
+                conn,
+                tokens,
+                filters,
+                overfetch,
+                sql="""
+                    SELECT cat.agregado_id AS table_id,
+                           cat.categoria_id AS child_id,
+                           cat.nome,
+                           cat.unidade,
+                           cat.classification_id,
+                           NULL AS category_id
+                    FROM categories cat
+                    JOIN agregados a ON a.id = cat.agregado_id
+                """,
+                fields=["cat.nome", "cat.unidade"],
+                entity_type="category",
+            )
+        )
+
+    return results
+
+
+def _lexical_child_query(
+    conn,
+    tokens: Sequence[str],
+    filters: SearchFilters | None,
+    limit: int,
+    sql: str,
+    fields: Sequence[str],
+    entity_type: str,
+) -> list[tuple[int, ChildMatch]]:
+    conditions, params = _filters_to_sql(filters, table_alias="a")
+    token_clauses: list[str] = []
+    for token in tokens:
+        pattern = f"%{token}%"
+        field_clauses = [f"LOWER({field}) LIKE ?" for field in fields]
+        token_clauses.append("(" + " OR ".join(field_clauses) + ")")
+        params.extend([pattern] * len(fields))
+
+    where_segments = conditions[:]
+    if token_clauses:
+        where_segments.append(" AND ".join(token_clauses))
+
+    query = sql
+    if where_segments:
+        query += " WHERE " + " AND ".join(where_segments)
+    query += " LIMIT ?"
+    params.append(int(limit))
+
+    rows = conn.execute(query, params).fetchall()
+    hits: list[tuple[int, ChildMatch]] = []
+    for row in rows:
+        name = row["nome"] or ""
+        keys = set(row.keys())
+        unit = row["unidade"] if "unidade" in keys else None
+        score = _compute_lexical_score(tokens, [name, unit or ""])
+        if score <= 0:
+            continue
+        metadata: dict[str, str] = {}
+        if unit:
+            metadata["unit"] = str(unit)
+        classification_id = row["classification_id"] if "classification_id" in keys else None
+        if classification_id is not None:
+            metadata["classification_id"] = str(classification_id)
+        child_id = str(row["child_id"])
+        match = ChildMatch(
+            entity_type=entity_type,
+            entity_id=child_id,
+            title=str(name).strip() or f"{entity_type.title()} {child_id}",
+            lexical_score=float(score),
+            metadata=metadata,
+        )
+        hits.append((int(row["table_id"]), match))
+    return hits
+
+
+def _aggregate_children_by_table(
+    child_hits: Sequence[tuple[int, ChildMatch]],
+    tokens: Sequence[str],
+    max_matches: int,
+) -> dict[int, dict[str, object]]:
+    if not child_hits:
+        return {}
+
+    aggregated: dict[int, dict[str, object]] = {}
+    for table_id, match in child_hits:
+        bucket = aggregated.setdefault(table_id, {"matches": []})
+        bucket["matches"].append(match)
+
+    token_count = max(1, len(tokens))
+    for table_id, payload in aggregated.items():
+        matches: list[ChildMatch] = sorted(
+            payload["matches"],
+            key=lambda item: item.lexical_score,
+            reverse=True,
+        )
+        top_matches = matches[:max_matches] if max_matches > 0 else matches
+        total = sum(item.lexical_score for item in top_matches)
+        denom = max(1, len(top_matches))
+        payload["score"] = total / denom
+        payload["matches"] = top_matches
+    return aggregated
 
 
 def _build_agregado_summary(row) -> tuple[str, str | None, dict[str, str]]:
@@ -540,6 +769,33 @@ def _augment_agregado_metadata(conn, agregado_id: int, metadata: dict[str, str])
         ).fetchone()[0]
         metadata["classifications_count"] = str(int(count))
 
+    level_rows = conn.execute(
+        """
+        SELECT level_id, level_name, level_type, locality_count
+        FROM agregados_levels
+        WHERE agregado_id = ?
+        ORDER BY locality_count DESC, level_id
+        """,
+        (agregado_id,),
+    ).fetchall()
+    if level_rows:
+        samples: list[str] = []
+        for row in level_rows[:5]:
+            level_id = row["level_id"]
+            level_name = row["level_name"] or ""
+            level_type = row["level_type"] or ""
+            locality_count = row["locality_count"]
+            snippet_parts = [level_id]
+            if level_name:
+                snippet_parts.append(level_name)
+            if level_type:
+                snippet_parts.append(level_type)
+            if locality_count is not None:
+                snippet_parts.append(f"{int(locality_count):,}")
+            samples.append(" / ".join(str(part) for part in snippet_parts if part))
+        metadata["levels_sample"] = "; ".join(samples)
+        metadata["levels_count"] = str(len(level_rows))
+
 
 def _fetch_agregado_row(conn, agregado_id: int | None):
     if agregado_id is None:
@@ -590,73 +846,149 @@ def _passes_filters(row, filters: SearchFilters | None) -> bool:
 def hybrid_search(
     query: str,
     *,
-    entity_types: Sequence[str] | None = None,
     limit: int = 10,
     filters: SearchFilters | None = None,
     embedding_client: EmbeddingClient | None = None,
     model: str | None = None,
+    child_types: Sequence[str] | None = None,
+    max_child_matches: int = 6,
+    weights: Mapping[str, float] | None = None,
 ) -> list[SemanticResult]:
     if limit <= 0:
         return []
 
+    child_types = list(child_types) if child_types is not None else [
+        "variable",
+        "classification",
+        "category",
+    ]
     tokens = _tokenize(query)
-    overfetch = max(limit * 5, limit)
+    weight_map = _resolve_weights(weights)
+    overfetch = max(limit * 5, 50)
 
     matches = semantic_search(
         query,
-        entity_types=entity_types,
+        entity_types=["agregado"],
         limit=overfetch,
         embedding_client=embedding_client,
         model=model,
     )
 
-    result_map: dict[tuple[str, str], dict[str, object]] = {}
+    table_candidates: dict[int, dict[str, object]] = {}
+
+    def _ensure_entry(table_id: int) -> dict[str, object]:
+        entry = table_candidates.get(table_id)
+        if entry is None:
+            entry = {
+                "match": SemanticMatch(
+                    entity_type="agregado",
+                    entity_id=str(table_id),
+                    agregado_id=table_id,
+                    score=0.0,
+                    model=model or "lexical",
+                ),
+                "semantic": 0.0,
+                "lex_table": 0.0,
+            }
+            table_candidates[table_id] = entry
+        return entry
+
     for match in matches:
-        key = (match.entity_type, match.entity_id)
-        result_map[key] = {"match": match, "lexical_hint": 0.0}
+        if match.agregado_id is None:
+            continue
+        entry = _ensure_entry(match.agregado_id)
+        if match.score > entry["semantic"]:
+            entry["match"] = match
+        entry["semantic"] = max(entry["semantic"], match.score)
 
     with sqlite_session() as conn:
-        lexical_candidates = _lexical_candidates(conn, tokens, filters, max(overfetch, 50))
+        lexical_candidates = _lexical_candidates(
+            conn,
+            tokens,
+            filters,
+            max(overfetch, 50),
+        )
         for agregado_id, lexical_score in lexical_candidates:
-            key = ("agregado", str(agregado_id))
-            if key not in result_map:
-                result_map[key] = {
-                    "match": SemanticMatch(
-                        entity_type="agregado",
-                        entity_id=str(agregado_id),
-                        agregado_id=agregado_id,
-                        score=0.0,
-                        model=model or "lexical",
-                    ),
-                    "lexical_hint": lexical_score,
-                }
-            else:
-                result_map[key]["lexical_hint"] = max(
-                    float(result_map[key]["lexical_hint"]), float(lexical_score)
-                )
+            entry = _ensure_entry(agregado_id)
+            entry["lex_table"] = max(float(entry.get("lex_table", 0.0)), float(lexical_score))
+
+        child_hits = _lexical_children(
+            conn,
+            tokens,
+            filters,
+            max(overfetch, 200),
+            child_types,
+        )
+        child_map = _aggregate_children_by_table(
+            child_hits,
+            tokens,
+            max_child_matches,
+        )
+
+        for agregado_id in child_map.keys():
+            _ensure_entry(agregado_id)
 
         enriched: list[SemanticResult] = []
-        for key, payload in result_map.items():
+        for table_id, payload in table_candidates.items():
             match: SemanticMatch = payload["match"]  # type: ignore[assignment]
+            semantic_score = float(payload.get("semantic", 0.0))
             result, aggregator_row = _enrich_match(conn, match)
 
-            row_for_filters = aggregator_row or _fetch_agregado_row(conn, match.agregado_id)
+            if aggregator_row is None:
+                aggregator_row = _fetch_agregado_row(conn, table_id)
 
-            if match.entity_type == "agregado" and match.agregado_id is not None and row_for_filters is not None:
-                metadata = dict(result.metadata)
-                _augment_agregado_metadata(conn, match.agregado_id, metadata)
-                result = replace(result, metadata=metadata)
-
-            if not _passes_filters(row_for_filters, filters):
+            if not _passes_filters(aggregator_row, filters):
                 continue
 
-            text_parts = [result.title or "", result.description or ""]
-            if isinstance(result.metadata, Mapping):
-                text_parts.extend(str(value) for value in result.metadata.values())
-            lexical_score = _compute_lexical_score(tokens, text_parts)
-            lexical_score = max(float(lexical_score), float(payload["lexical_hint"]))
-            combined_score = _combine_scores(result.score, lexical_score)
-            result = replace(result, lexical_score=lexical_score, combined_score=combined_score)
+            if match.entity_type == "agregado" and aggregator_row is not None:
+                metadata = dict(result.metadata)
+                _augment_agregado_metadata(conn, table_id, metadata)
+                result = replace(result, metadata=metadata)
+
+            lexical_table_score = float(payload.get("lex_table", 0.0))
+            lexical_from_text = _compute_lexical_score(
+                tokens,
+                [result.title or "", result.description or ""],
+            )
+            lexical_table_score = max(lexical_table_score, lexical_from_text)
+
+            child_payload = child_map.get(table_id, {})
+            lexical_children_score = float(child_payload.get("score", 0.0))
+            child_matches = tuple(child_payload.get("matches", ()))
+
+            if semantic_score <= 0:
+                semantic_score = result.score
+            result = replace(result, score=semantic_score)
+
+            boost = 0.0
+            if aggregator_row is not None:
+                covers_national = int(aggregator_row["covers_national_municipalities"] or 0)
+                if covers_national:
+                    boost += 0.03
+                if filters and filters.period_start is not None:
+                    try:
+                        period_end = int(str(aggregator_row["periodo_fim"])) if aggregator_row["periodo_fim"] else None
+                    except (TypeError, ValueError):
+                        period_end = None
+                    if period_end is not None and period_end >= filters.period_start:
+                        boost += 0.02
+
+            combined = (
+                weight_map.get("sem", 0.0) * semantic_score
+                + weight_map.get("lex_table", 0.0) * lexical_table_score
+                + weight_map.get("lex_children", 0.0) * lexical_children_score
+                + boost
+            )
+
+            lexical_total = lexical_table_score + lexical_children_score
+            result = replace(
+                result,
+                lexical_table_score=lexical_table_score,
+                lexical_children_score=lexical_children_score,
+                lexical_score=lexical_total,
+                combined_score=combined,
+                child_matches=child_matches,
+            )
             enriched.append(result)
 
     enriched.sort(key=lambda item: item.combined_score, reverse=True)
@@ -667,6 +999,7 @@ __all__ = [
     "SemanticMatch",
     "SemanticResult",
     "SearchFilters",
+    "ChildMatch",
     "semantic_search",
     "semantic_search_with_metadata",
     "hybrid_search",

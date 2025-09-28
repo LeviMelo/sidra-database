@@ -12,6 +12,7 @@ from .bulk_ingest import (
 )
 from .discovery import CatalogEntry
 from .search import (
+    ChildMatch,
     SemanticMatch,
     SemanticResult,
     SearchFilters,
@@ -38,6 +39,7 @@ __all__ = [
     "CatalogEntry",
     "discover_agregados_by_coverage",
     "ingest_by_coverage",
+    "ChildMatch",
     "SemanticMatch",
     "SemanticResult",
     "SearchFilters",
