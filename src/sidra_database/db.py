@@ -19,9 +19,12 @@ def create_connection() -> sqlite3.Connection:
     settings = get_settings()
     path = get_database_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=settings.database_timeout)
-    connection.execute("PRAGMA journal_mode=WAL")
+    timeout = max(float(settings.database_timeout), 60.0)
+    connection = sqlite3.connect(path, timeout=timeout, check_same_thread=False)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute("PRAGMA busy_timeout=60000")
     return connection
 
 
