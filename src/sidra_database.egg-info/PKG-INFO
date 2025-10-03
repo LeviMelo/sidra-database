@@ -64,3 +64,11 @@ Configuration values can be supplied via a simple JSON file (`sidra.config.json`
 - Because only agregados have stored vectors, use `--model` to switch embedding backends for table-level relevance; sub-entities will continue to rely on lexical scoring.
 
 Each result reports semantic, lexical, and combined scores. When the combined score is close to the lexical score, the item entered the ranking via the textual enrichment path.
+
+## Next-gen Value Atom search
+
+A new additive package, `sidra_va`, materialises fine-grained Value Atoms that
+capture variable + classification/category slices, territorial coverage and
+period ranges. It ships its own CLI (`python -m sidra_va.cli`) for migrations,
+indexing, embedding, searching and compatibility discovery. See
+[docs/value_atoms.md](docs/value_atoms.md) for end-to-end instructions.

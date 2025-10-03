@@ -52,3 +52,10 @@ temp/
 
 # --- OS-specific path you mentioned ---
 sidra.db
+codebase_dump_sidra-database.txt
+src/sidra_database/__pycache__/config.cpython-312.pyc
+src/sidra_database/__pycache__/ingest.cpython-312.pyc
+src/sidra_database.egg-info/PKG-INFO
+src/sidra_database.egg-info/SOURCES.txt
+src/sidra_database.egg-info/top_level.txt
+src/sidra_va/codebase_dump_sidra_va.txt
