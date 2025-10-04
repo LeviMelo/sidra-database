@@ -7,9 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from .base_schema import apply_base_schema
 from .config import get_settings
-from .schema_migrations import apply_va_schema
 
 
 def _has_base_tables(path: Path) -> bool:
@@ -57,9 +55,7 @@ def get_database_path() -> Path:
     """Resolve the SQLite database path used for VA operations."""
 
     global _DATABASE_PATH, _LAST_ENV_VALUE
-    env_value = os.getenv("SIDRA_VA_DATABASE_PATH")
-    if env_value is None:
-        env_value = os.getenv("SIDRA_DATABASE_PATH")
+    env_value = os.getenv("SIDRA_DATABASE_PATH")
     if _DATABASE_PATH is None or env_value != _LAST_ENV_VALUE:
         _DATABASE_PATH = _resolve_database_path(env_value)
         _LAST_ENV_VALUE = env_value
@@ -79,9 +75,6 @@ def create_connection() -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=NORMAL")
-    connection.execute("PRAGMA temp_store=MEMORY")
-    connection.execute("PRAGMA mmap_size=268435456")
-    connection.execute("PRAGMA cache_size=-200000")
     busy_timeout_ms = max(int(timeout * 1000), 60000)
     connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
     return connection
@@ -96,19 +89,5 @@ def sqlite_session() -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
-def ensure_full_schema(connection: sqlite3.Connection | None = None) -> None:
-    close = False
-    if connection is None:
-        connection = create_connection()
-        close = True
-    try:
-        apply_base_schema(connection)
-        apply_va_schema(connection)
-        connection.commit()
-    finally:
-        if close:
-            connection.close()
-
-
-__all__ = ["create_connection", "ensure_full_schema", "get_database_path", "sqlite_session"]
+__all__ = ["create_connection", "get_database_path", "sqlite_session"]
 

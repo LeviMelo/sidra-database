@@ -4,18 +4,9 @@ import argparse
 import asyncio
 import json
 import sqlite3
-from dataclasses import asdict
-from typing import Iterable, Sequence
+from typing import Iterable
 
-from .api_client import SidraApiClient
-from .bulk_ingest import ingest_by_coverage
-from .catalog import list_agregados
-from .db import create_connection, ensure_full_schema
-from .diagnostics_base import (
-    api_vs_db_spot_check,
-    global_health_report,
-    repair_missing_variables,
-)
+from .db import create_connection
 from .embed import embed_vas_for_agregados
 from .embedding_client import EmbeddingClient
 from .ingest_base import ingest_agregado
@@ -27,169 +18,10 @@ from .value_index import build_va_index_for_agregado, build_va_index_for_all
 
 
 def _ensure_va_schema() -> None:
-    ensure_full_schema()
-
-
-def _base_counts(conn) -> tuple[int, int]:
-    try:
-        total = conn.execute("SELECT COUNT(*) FROM agregados").fetchone()[0]
-    except sqlite3.OperationalError:
-        return 0, 0
-    try:
-        with_vars = conn.execute(
-            "SELECT COUNT(DISTINCT agregado_id) FROM variables"
-        ).fetchone()[0]
-    except sqlite3.OperationalError:
-        with_vars = 0
-    return int(total or 0), int(with_vars or 0)
-
-
-def _require_base_metadata(
-    conn,
-    ids: Iterable[int] | None = None,
-) -> tuple[bool, list[int]]:
-    for table in ("agregados", "variables"):
-        try:
-            conn.execute(f"SELECT 1 FROM {table} LIMIT 1")
-        except sqlite3.OperationalError:
-            print(
-                f"Base table '{table}' is missing. Run 'sidra_va.cli ingest' before using sidra-va.",
-            )
-            return False, []
-
-    total, with_vars = _base_counts(conn)
-    if total == 0:
-        print("Database contains no agregados. Run 'sidra_va.cli ingest' first.")
-        return False, []
-    if with_vars == 0:
-        print(
-            "No agregados with variables found. Re-ingest metadata or run 'sidra_va.cli repair-missing'."
-        )
-        return False, []
-
-    zero_ids: list[int] = []
-    if ids:
-        for raw_id in ids:
-            agregado_id = int(raw_id)
-            count = conn.execute(
-                "SELECT COUNT(*) FROM variables WHERE agregado_id = ?",
-                (agregado_id,),
-            ).fetchone()[0]
-            if int(count or 0) == 0:
-                zero_ids.append(agregado_id)
-    return True, zero_ids
-
-
-def _count_rows(conn, table: str) -> int:
-    try:
-        row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
-    except sqlite3.OperationalError:
-        return 0
-    return int(row[0] or 0)
-
-
-async def _ingest_ids(
-    agregado_ids: Sequence[int],
-    *,
-    concurrency: int,
-    generate_embeddings: bool,
-) -> tuple[int, list[tuple[int, str]]]:
-    """Ingest the provided agregados concurrently."""
-
-    if not agregado_ids:
-        return 0, []
-
-    concurrency = max(1, concurrency)
-    semaphore = asyncio.Semaphore(concurrency)
-    db_lock = asyncio.Lock() if concurrency > 1 else None
-    failures: list[tuple[int, str]] = []
-    succeeded = 0
-
-    async with SidraApiClient() as client:
-        embedding_client = EmbeddingClient() if generate_embeddings else None
-
-        async def worker(agregado_id: int) -> None:
-            nonlocal succeeded
-            async with semaphore:
-                try:
-                    await ingest_agregado(
-                        agregado_id,
-                        client=client,
-                        embedding_client=embedding_client,
-                        generate_embeddings=generate_embeddings,
-                        db_lock=db_lock,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    message = str(exc)[:200]
-                    failures.append((agregado_id, message))
-                    print(f"Failed agregado {agregado_id}: {message}")
-                else:
-                    succeeded += 1
-
-        await asyncio.gather(*(worker(agregado_id) for agregado_id in agregado_ids))
-
-    return succeeded, failures
-
-
-def cmd_ingest(args: argparse.Namespace) -> None:
-    _ensure_va_schema()
-    agregado_ids = [int(value) for value in args.agregado_ids]
-    succeeded, failures = asyncio.run(
-        _ingest_ids(
-            agregado_ids,
-            concurrency=args.concurrent,
-            generate_embeddings=not args.skip_embeddings,
-        )
-    )
-    total = len(agregado_ids)
-    print(f"Ingested {succeeded}/{total} agregados")
-    if failures:
-        print("Failures:")
-        for agregado_id, message in failures[:10]:
-            print(f"  {agregado_id}: {message}")
-        remaining = len(failures) - 10
-        if remaining > 0:
-            print(f"  ... ({remaining} more)")
-
-
-def cmd_ingest_coverage(args: argparse.Namespace) -> None:
-    _ensure_va_schema()
-    report = asyncio.run(
-        ingest_by_coverage(
-            require_any_levels=args.any_levels,
-            require_all_levels=args.all_levels,
-            exclude_levels=args.exclude_levels,
-            subject_contains=args.subject_contains,
-            survey_contains=args.survey_contains,
-            limit=args.limit,
-            concurrency=max(1, args.concurrent),
-            skip_existing=args.skip_existing,
-            dry_run=args.dry_run,
-            generate_embeddings=not args.skip_embeddings,
-        )
-    )
-    print(json.dumps(report.as_dict(), indent=2, ensure_ascii=False))
-
-
-def cmd_repair_missing(args: argparse.Namespace) -> None:
-    _ensure_va_schema()
-    result = asyncio.run(
-        repair_missing_variables(
-            chunk_size=max(1, args.chunk),
-            concurrency=max(1, args.concurrent),
-            limit=args.limit,
-            max_retries=max(1, args.retries),
-        )
-    )
-    payload = asdict(result)
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
-
-
-def cmd_diagnostics_health(args: argparse.Namespace) -> None:
-    _ensure_va_schema()
     conn = create_connection()
     try:
-        report = global_health_report(conn, sample_limit=max(0, args.health_sample))
+        apply_va_schema(conn)
+        conn.commit()
     finally:
         conn.close()
     print(json.dumps(report, indent=2, ensure_ascii=False))
@@ -228,6 +60,64 @@ def cmd_list_agregados(args: argparse.Namespace) -> None:
             f"{row.id}: {row.nome} | assunto={row.assunto} | pesquisa={row.pesquisa} | "
             f"{coverage} ({national})"
         )
+
+
+def _base_counts(conn) -> tuple[int, int]:
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM agregados").fetchone()[0]
+    except sqlite3.OperationalError:
+        return 0, 0
+    try:
+        with_vars = conn.execute(
+            "SELECT COUNT(DISTINCT agregado_id) FROM variables"
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        with_vars = 0
+    return int(total or 0), int(with_vars or 0)
+
+
+def _require_base_metadata(
+    conn,
+    ids: Iterable[int] | None = None,
+) -> tuple[bool, list[int]]:
+    for table in ("agregados", "variables"):
+        try:
+            conn.execute(f"SELECT 1 FROM {table} LIMIT 1")
+        except sqlite3.OperationalError:
+            print(
+                f"Base table '{table}' is missing. Run 'sidra_database.cli ingest' before using sidra-va.",
+            )
+            return False, []
+
+    total, with_vars = _base_counts(conn)
+    if total == 0:
+        print("Database contains no agregados. Run 'sidra_database.cli ingest' first.")
+        return False, []
+    if with_vars == 0:
+        print(
+            "No agregados with variables found. Re-ingest metadata or run 'sidra_database.cli repair-missing'."
+        )
+        return False, []
+
+    zero_ids: list[int] = []
+    if ids:
+        for raw_id in ids:
+            agregado_id = int(raw_id)
+            count = conn.execute(
+                "SELECT COUNT(*) FROM variables WHERE agregado_id = ?",
+                (agregado_id,),
+            ).fetchone()[0]
+            if int(count or 0) == 0:
+                zero_ids.append(agregado_id)
+    return True, zero_ids
+
+
+def _count_rows(conn, table: str) -> int:
+    try:
+        row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    return int(row[0] or 0)
 
 
 def cmd_db_migrate(args: argparse.Namespace) -> None:
@@ -295,7 +185,9 @@ def cmd_index_build(args: argparse.Namespace) -> None:
 
     ready_ids = [ag for ag in args.ids if ag not in missing_ids]
     for missing in missing_ids:
-        print(f"No variables for table {missing}; run 'sidra_va.cli ingest {missing}' first.")
+        print(
+            f"No variables for table {missing}; run 'sidra_database.cli ingest {missing}' first."
+        )
     if not ready_ids:
         return
 
@@ -327,7 +219,9 @@ def cmd_index_embed(args: argparse.Namespace) -> None:
     if requested_ids:
         valid_ids = [ag for ag in requested_ids if ag not in missing_ids]
         for missing in missing_ids:
-            print(f"No variables for table {missing}; run 'sidra_va.cli ingest {missing}' first.")
+            print(
+                f"No variables for table {missing}; run 'sidra_database.cli ingest {missing}' first."
+            )
     else:
         valid_ids = None
 
@@ -470,7 +364,7 @@ def cmd_show_table(args: argparse.Namespace) -> None:
             return
         if missing_ids:
             print(
-                f"No variables for table {args.agregado_id}; run 'sidra_va.cli ingest {args.agregado_id}' first."
+                f"No variables for table {args.agregado_id}; run 'sidra_database.cli ingest {args.agregado_id}' first."
             )
             return
         row = conn.execute(
@@ -738,7 +632,7 @@ def build_parser() -> argparse.ArgumentParser:
     neighbors_cmd.add_argument("--allow-unit-mismatch", action="store_true")
     neighbors_cmd.set_defaults(func=cmd_link_neighbors)
 
-    diag_parser = subparsers.add_parser("diagnostics", help="Run diagnostics")
+    diag_parser = subparsers.add_parser("diagnostics")
     diag_parser.add_argument("--sample", type=int, default=5)
     diag_parser.add_argument(
         "--smoke-query",
@@ -747,18 +641,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     diag_parser.add_argument("--smoke-limit", type=int, default=5)
     diag_parser.set_defaults(func=cmd_diagnostics)
-    diag_sub = diag_parser.add_subparsers(dest="diagnostics_command")
-
-    diag_health = diag_sub.add_parser("health", help="Report base ingestion health")
-    diag_health.add_argument("--sample", dest="health_sample", type=int, default=50)
-    diag_health.set_defaults(func=cmd_diagnostics_health)
-
-    diag_spot = diag_sub.add_parser(
-        "spot-check",
-        help="Sample agregados missing variables and compare with live API",
-    )
-    diag_spot.add_argument("--sample", dest="spot_sample", type=int, default=10)
-    diag_spot.set_defaults(func=cmd_diagnostics_spot_check)
 
     return parser
 
