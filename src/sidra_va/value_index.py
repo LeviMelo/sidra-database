@@ -1,18 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from dataclasses import dataclass
 from typing import Any, Dict
 
-from sidra_database.db import create_connection, ensure_schema
-
+from .db import create_connection
 from .fingerprints import variable_fingerprint
 from .schema_migrations import apply_va_schema
 from .synonyms import SynonymMap, load_synonyms_into_memory
 from .utils import json_dumps, run_with_retries, utcnow_iso
-
-TWO_DIM_ALLOWLIST: set[tuple[int, int]] = set()
 
 
 @dataclass
@@ -40,25 +36,21 @@ class _Classification:
 async def build_va_index_for_agregado(
     agregado_id: int,
     *,
-    allow_two_dim_combos: bool = False,
     upsert: bool = True,
 ) -> int:
     return await asyncio.to_thread(
         _build_va_index_for_agregado_sync,
         agregado_id,
-        allow_two_dim_combos,
         upsert,
     )
 
 
 def _build_va_index_for_agregado_sync(
     agregado_id: int,
-    allow_two_dim_combos: bool,
     upsert: bool,
 ) -> int:
     conn = create_connection()
     try:
-        ensure_schema(conn)
         apply_va_schema(conn)
         conn.row_factory = dict_row_factory
         cursor = conn.execute(
@@ -68,8 +60,9 @@ def _build_va_index_for_agregado_sync(
         row = cursor.fetchone()
         if not row:
             raise ValueError(f"Agregado {agregado_id} not found")
-        _metadata = _decode_raw_json(row["raw_json"])
         variables = _load_variables(conn, agregado_id)
+        if not variables:
+            return 0
         classifications = _load_classifications(conn, agregado_id)
         levels = _load_levels(conn, agregado_id)
         synonyms = load_synonyms_into_memory(conn)
@@ -328,19 +321,6 @@ def _load_levels(conn, agregado_id: int) -> Dict[str, str]:
     return {row["level_id"]: row["level_name"] for row in cursor.fetchall()}
 
 
-def _decode_raw_json(raw: Any) -> dict[str, Any]:
-    if isinstance(raw, memoryview):
-        raw = raw.tobytes()
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8")
-    if isinstance(raw, str):
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
-    return dict(raw or {})
-
-
 def dict_row_factory(cursor, row):
     return {cursor.description[idx][0]: value for idx, value in enumerate(row)}
 
@@ -348,13 +328,13 @@ def dict_row_factory(cursor, row):
 async def build_va_index_for_all(
     *,
     concurrency: int = 1,
-    allow_two_dim_combos: bool = False,
 ) -> dict[str, int]:
     conn = create_connection()
     try:
-        ensure_schema(conn)
         apply_va_schema(conn)
-        cursor = conn.execute("SELECT id FROM agregados ORDER BY id")
+        cursor = conn.execute(
+            "SELECT DISTINCT agregado_id FROM variables ORDER BY agregado_id"
+        )
         ids = [row[0] for row in cursor.fetchall()]
     finally:
         conn.close()
@@ -369,7 +349,6 @@ async def build_va_index_for_all(
         async with semaphore:
             count = await build_va_index_for_agregado(
                 agregado_id,
-                allow_two_dim_combos=allow_two_dim_combos,
             )
             results[str(agregado_id)] = count
 

@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import json
-from typing import List, Mapping
+from typing import Mapping
 
-from sidra_database.db import create_connection, ensure_schema
-
+from .db import create_connection
 from .schema_migrations import apply_va_schema
 from .search_va import VaResult
-from .synonyms import load_synonyms_into_memory, normalize_basic
+from .synonyms import normalize_basic
 
 
 def _levels(row) -> set[str]:
@@ -55,9 +53,14 @@ def _compat_score(seed, candidate, seed_dims, candidate_dims, require_same_unit:
         return 0.0
     unit_compat = 1.0 if normalize_basic(unit_seed) == normalize_basic(unit_candidate) else 0.5 if unit_seed and unit_candidate else 0.0
 
-    seed_cats = {normalize_basic(dim["category_name"]) for dim in seed_dims}
-    cand_cats = {normalize_basic(dim["category_name"]) for dim in candidate_dims}
-    dim_compat = 1.0 if seed_cats == cand_cats and seed_cats else 0.0
+    seed_cats = {normalize_basic(dim["category_name"]) for dim in seed_dims if dim["category_name"]}
+    cand_cats = {normalize_basic(dim["category_name"]) for dim in candidate_dims if dim["category_name"]}
+    if seed_cats or cand_cats:
+        union = seed_cats | cand_cats
+        intersection = seed_cats & cand_cats
+        dim_compat = (len(intersection) / len(union)) if union else 0.0
+    else:
+        dim_compat = 1.0
 
     seed_levels = _levels(seed)
     candidate_levels = _levels(candidate)
@@ -89,7 +92,6 @@ def find_neighbors_for_va(
 ) -> list[tuple[VaResult, float]]:
     conn = create_connection()
     try:
-        ensure_schema(conn)
         apply_va_schema(conn)
         cursor = conn.execute(
             """

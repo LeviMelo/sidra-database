@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 
-VA_SCHEMA_VERSION = 1
+VA_SCHEMA_VERSION = 2
 
 
 def _ensure_meta_table(connection: sqlite3.Connection) -> None:
@@ -43,6 +43,29 @@ def apply_va_schema(connection: sqlite3.Connection) -> None:
         return
 
     with connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS embeddings (
+              entity_type TEXT NOT NULL,
+              entity_id TEXT NOT NULL,
+              agregado_id INTEGER,
+              text_hash TEXT NOT NULL,
+              model TEXT NOT NULL,
+              dimension INTEGER NOT NULL,
+              vector BLOB NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (entity_type, entity_id, model)
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_embeddings_agregado
+            ON embeddings(agregado_id, model)
+            """
+        )
+
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS value_atoms (

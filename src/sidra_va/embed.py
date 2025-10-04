@@ -3,9 +3,8 @@ from __future__ import annotations
 import asyncio
 from array import array
 
-from sidra_database.db import create_connection, ensure_schema
-from sidra_database.embedding import EmbeddingClient
-
+from .db import create_connection
+from .embedding_client import EmbeddingClient
 from .schema_migrations import apply_va_schema
 from .utils import run_with_retries, sha256_text, utcnow_iso
 
@@ -28,7 +27,6 @@ async def embed_vas_for_agregados(
     def _collect_targets():
         conn = create_connection()
         try:
-            ensure_schema(conn)
             apply_va_schema(conn)
             if agregado_ids is None:
                 cursor = conn.execute("SELECT va_id, agregado_id, text FROM value_atoms")
@@ -48,8 +46,6 @@ async def embed_vas_for_agregados(
         return {"embedded": 0, "skipped": 0, "failed": 0}
 
     semaphore = asyncio.Semaphore(concurrency)
-    stats = {"embedded": 0, "skipped": 0, "failed": 0}
-
     async def _process(target):
         va_id, agregado_id, text = target
         text_hash = sha256_text(text)
@@ -57,7 +53,6 @@ async def embed_vas_for_agregados(
         def _should_embed() -> bool:
             conn = create_connection()
             try:
-                ensure_schema(conn)
                 apply_va_schema(conn)
                 row = conn.execute(
                     "SELECT text_hash FROM embeddings WHERE entity_type = 'va' AND entity_id = ? AND model = ?",
@@ -71,49 +66,51 @@ async def embed_vas_for_agregados(
 
         should_embed = await asyncio.to_thread(_should_embed)
         if not should_embed:
-            stats["skipped"] += 1
-            return
+            return "skipped"
 
         async with semaphore:
             try:
                 vector = await asyncio.to_thread(client.embed_text, text, model=model_name)
             except Exception:
-                stats["failed"] += 1
-                return
+                return "failed"
 
-            def _persist() -> None:
+        def _persist() -> None:
+            conn = create_connection()
+            try:
+                apply_va_schema(conn)
+
                 def _write() -> None:
-                    conn = create_connection()
-                    try:
-                        ensure_schema(conn)
-                        apply_va_schema(conn)
-                        with conn:
-                            conn.execute(
-                                """
-                                INSERT OR REPLACE INTO embeddings (
-                                    entity_type, entity_id, agregado_id, text_hash, model, dimension, vector, created_at
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                                """,
-                                (
-                                    "va",
-                                    va_id,
-                                    agregado_id,
-                                    text_hash,
-                                    model_name,
-                                    len(vector),
-                                    _vector_to_blob(vector),
-                                    utcnow_iso(),
-                                ),
-                            )
-                    finally:
-                        conn.close()
+                    with conn:
+                        conn.execute(
+                            """
+                            INSERT OR REPLACE INTO embeddings (
+                                entity_type, entity_id, agregado_id, text_hash, model, dimension, vector, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                "va",
+                                va_id,
+                                agregado_id,
+                                text_hash,
+                                model_name,
+                                len(vector),
+                                _vector_to_blob(vector),
+                                utcnow_iso(),
+                            ),
+                        )
 
                 run_with_retries(_write)
+            finally:
+                conn.close()
 
-            await asyncio.to_thread(_persist)
-            stats["embedded"] += 1
+        await asyncio.to_thread(_persist)
+        return "embedded"
 
-    await asyncio.gather(*[_process(target) for target in targets])
+    outcomes = await asyncio.gather(*[_process(target) for target in targets])
+    stats = {"embedded": 0, "skipped": 0, "failed": 0}
+    for outcome in outcomes:
+        if outcome in stats:
+            stats[outcome] += 1
     return stats
 
 

@@ -7,9 +7,8 @@ from array import array
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Mapping, Sequence
 
-from sidra_database.db import create_connection, ensure_schema
-from sidra_database.embedding import EmbeddingClient
-
+from .db import create_connection
+from .embedding_client import EmbeddingClient
 from .schema_migrations import apply_va_schema
 from .scoring import DEFAULT_WEIGHTS, StructureMatch, rrf
 from .synonyms import SynonymMap, load_synonyms_into_memory, normalize_basic
@@ -42,9 +41,45 @@ class VaResult:
     why: str
 
 
+LEVEL_COLUMN_MAP = {"N1": "has_n1", "N2": "has_n2", "N3": "has_n3", "N6": "has_n6"}
+
+
 def _tokenize_query(text: str, synonyms: SynonymMap | None) -> list[str]:
     words = text.split()
     return [normalize_basic(word) for word in words if normalize_basic(word)]
+
+
+def _structural_candidate_ids(
+    conn,
+    filters: VaSearchFilters,
+    limit: int,
+) -> set[str]:
+    clauses: list[str] = []
+    params: list[object] = []
+    for level in filters.require_levels:
+        column = LEVEL_COLUMN_MAP.get(level.upper())
+        if column:
+            clauses.append(f"va.{column} = 1")
+    if filters.period_start is not None:
+        clauses.append("(va.period_end IS NULL OR CAST(va.period_end AS INTEGER) >= ?)")
+        params.append(filters.period_start)
+    if filters.period_end is not None:
+        clauses.append("(va.period_start IS NULL OR CAST(va.period_start AS INTEGER) <= ?)")
+        params.append(filters.period_end)
+    if filters.min_municipalities is not None:
+        clauses.append("COALESCE(ag.municipality_locality_count, 0) >= ?")
+        params.append(filters.min_municipalities)
+    if filters.requires_national_munis:
+        clauses.append("ag.covers_national_municipalities = 1")
+    where = " AND ".join(clauses) if clauses else "1=1"
+    sql = (
+        "SELECT va.va_id FROM value_atoms AS va "
+        "JOIN agregados AS ag ON ag.id = va.agregado_id "
+        f"WHERE {where} ORDER BY va.rowid LIMIT ?"
+    )
+    params.append(limit)
+    cursor = conn.execute(sql, tuple(params))
+    return {row[0] for row in cursor.fetchall()}
 
 
 def _build_fts_query(tokens: list[str]) -> str:
@@ -88,12 +123,13 @@ async def search_value_atoms(
 
     conn = create_connection()
     try:
-        ensure_schema(conn)
         apply_va_schema(conn)
         synonyms = load_synonyms_into_memory(conn)
 
         tokens = _tokenize_query(query, synonyms)
         fts_query = _build_fts_query(tokens)
+        structural_limit = max(5000, limit * 50)
+        structural_candidates = _structural_candidate_ids(conn, filters, structural_limit)
         lexical_candidates: list[str] = []
         if fts_query:
             cursor = conn.execute(
@@ -102,8 +138,10 @@ async def search_value_atoms(
             )
             lexical_candidates = [row[0] for row in cursor.fetchall()]
         lexical_ranks = {va_id: idx + 1 for idx, va_id in enumerate(lexical_candidates)}
+        lexical_rrf = rrf(lexical_ranks) if lexical_ranks else {}
 
         semantic_ranks: Dict[str, int] = {}
+        semantic_rrf: Dict[str, float] = {}
         query_vector: list[float] | None = None
         if embedding_client is not None:
             query_vector = await asyncio.to_thread(
@@ -111,22 +149,31 @@ async def search_value_atoms(
                 query,
                 model=embedding_client.model,
             )
-            cursor = conn.execute(
-                """
-                SELECT entity_id, agregado_id, dimension, vector
-                FROM embeddings
-                WHERE entity_type = 'va' AND model = ?
-                """,
-                (embedding_client.model,),
-            )
-            similarities: list[tuple[str, float]] = []
-            for row in cursor.fetchall():
-                vector = _blob_to_vector(row["vector"], row["dimension"])
-                sim = _cosine_similarity(query_vector, vector)
-                if sim > 0:
-                    similarities.append((row["entity_id"], sim))
-            similarities.sort(key=lambda item: item[1], reverse=True)
-            semantic_ranks = {va_id: idx + 1 for idx, (va_id, _) in enumerate(similarities[: limit * 5])}
+            embedding_candidate_ids = set(structural_candidates)
+            if not embedding_candidate_ids and lexical_candidates:
+                embedding_candidate_ids = set(lexical_candidates)
+            if embedding_candidate_ids:
+                embedding_id_list = tuple(embedding_candidate_ids)
+                placeholders = ",".join("?" for _ in embedding_id_list)
+                cursor = conn.execute(
+                    f"""
+                    SELECT entity_id, dimension, vector
+                    FROM embeddings
+                    WHERE entity_type = 'va' AND model = ? AND entity_id IN ({placeholders})
+                    """,
+                    (embedding_client.model, *embedding_id_list),
+                )
+                similarities: list[tuple[str, float]] = []
+                for row in cursor.fetchall():
+                    vector = _blob_to_vector(row["vector"], row["dimension"])
+                    sim = _cosine_similarity(query_vector, vector)
+                    if sim > 0:
+                        similarities.append((row["entity_id"], sim))
+                similarities.sort(key=lambda item: item[1], reverse=True)
+                semantic_ranks = {
+                    va_id: idx + 1 for idx, (va_id, _) in enumerate(similarities[: limit * 5])
+                }
+                semantic_rrf = rrf(semantic_ranks) if semantic_ranks else {}
 
         all_candidate_ids = set(lexical_ranks) | set(semantic_ranks)
         if not all_candidate_ids:
@@ -170,16 +217,7 @@ async def search_value_atoms(
             continue
         struct = _compute_structure_score(row, dims, filters, query_tokens)
         struct_score = struct.score()
-        rrf_scores = 0.0
-        rank_inputs = {}
-        if row["va_id"] in lexical_ranks:
-            rank_inputs[row["va_id"]] = lexical_ranks[row["va_id"]]
-        if row["va_id"] in semantic_ranks:
-            rank_inputs[row["va_id"]] = min(
-                semantic_ranks[row["va_id"]], rank_inputs.get(row["va_id"], semantic_ranks[row["va_id"]])
-            )
-        if rank_inputs:
-            rrf_scores = sum(rrf(rank_inputs).values())
+        rrf_scores = lexical_rrf.get(row["va_id"], 0.0) + semantic_rrf.get(row["va_id"], 0.0)
         combined = weight_cfg.get("struct", 0.7) * struct_score + weight_cfg.get("rrf", 0.3) * rrf_scores
         title = row["variable_name"]
         if dims:

@@ -12,7 +12,7 @@ import orjson
 from .api_client import SidraApiClient
 from .config import get_settings
 from .db import sqlite_session
-from .embedding import EmbeddingClient
+from .embedding_client import EmbeddingClient
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 MUNICIPALITY_LEVEL_CODE = "N6"
@@ -290,7 +290,7 @@ async def ingest_agregado(
                         )
                     )
 
-        threshold_setting = max(0, int(settings.municipality_national_threshold))
+        threshold_setting = max(0, int(getattr(settings, "municipality_national_threshold", 0) or 0))
         if threshold_setting == 0:
             covers_national_munis = 1 if municipality_locality_count > 0 else 0
         else:
