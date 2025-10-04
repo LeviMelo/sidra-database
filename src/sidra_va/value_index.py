@@ -66,7 +66,6 @@ def _build_va_index_for_agregado_sync(
         row = cursor.fetchone()
         if not row:
             raise ValueError(f"Agregado {agregado_id} not found")
-        _metadata = _decode_raw_json(row["raw_json"])
         variables = _load_variables(conn, agregado_id)
         if not variables:
             return 0

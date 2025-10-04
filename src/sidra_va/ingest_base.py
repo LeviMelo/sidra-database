@@ -290,7 +290,11 @@ async def ingest_agregado(
                         )
                     )
 
-        threshold_setting = max(0, int(settings.municipality_national_threshold))
+        raw_threshold = getattr(settings, "municipality_national_threshold", 0)
+        try:
+            threshold_setting = max(0, int(raw_threshold))
+        except (TypeError, ValueError):
+            threshold_setting = 0
         if threshold_setting == 0:
             covers_national_munis = 1 if municipality_locality_count > 0 else 0
         else:

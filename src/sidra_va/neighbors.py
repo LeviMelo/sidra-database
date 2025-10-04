@@ -53,9 +53,15 @@ def _compat_score(seed, candidate, seed_dims, candidate_dims, require_same_unit:
         return 0.0
     unit_compat = 1.0 if normalize_basic(unit_seed) == normalize_basic(unit_candidate) else 0.5 if unit_seed and unit_candidate else 0.0
 
-    seed_cats = {normalize_basic(dim["category_name"]) for dim in seed_dims}
-    cand_cats = {normalize_basic(dim["category_name"]) for dim in candidate_dims}
-    dim_compat = 1.0 if seed_cats == cand_cats and seed_cats else 0.0
+    seed_cats = {normalize_basic(dim["category_name"]) for dim in seed_dims if dim["category_name"]}
+    cand_cats = {
+        normalize_basic(dim["category_name"]) for dim in candidate_dims if dim["category_name"]
+    }
+    if seed_cats or cand_cats:
+        union = seed_cats | cand_cats
+        dim_compat = (len(seed_cats & cand_cats) / len(union)) if union else 1.0
+    else:
+        dim_compat = 1.0
 
     seed_levels = _levels(seed)
     candidate_levels = _levels(candidate)

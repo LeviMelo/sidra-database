@@ -4,14 +4,19 @@ import argparse
 import asyncio
 import json
 import sqlite3
+from dataclasses import asdict
 from typing import Iterable
 
+from .api_client import SidraApiClient
+from .bulk_ingest import ingest_by_coverage
+from .catalog import list_agregados
 from .db import create_connection
+from .diagnostics_base import api_vs_db_spot_check, repair_missing_variables
 from .embed import embed_vas_for_agregados
 from .embedding_client import EmbeddingClient
 from .ingest_base import ingest_agregado
 from .neighbors import find_neighbors_for_va
-from .schema_migrations import get_schema_version
+from .schema_migrations import apply_va_schema, get_schema_version
 from .search_va import VaResult, VaSearchFilters, search_value_atoms
 from .synonyms import export_synonyms_csv, import_synonyms_csv
 from .value_index import build_va_index_for_agregado, build_va_index_for_all
@@ -24,7 +29,40 @@ def _ensure_va_schema() -> None:
         conn.commit()
     finally:
         conn.close()
-    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+
+async def _run_ingest(
+    agregado_ids: list[int],
+    *,
+    concurrency: int,
+    skip_embeddings: bool,
+) -> list[tuple[int, bool, str | None]]:
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+    db_lock = asyncio.Lock() if concurrency > 1 else None
+    client = SidraApiClient()
+    embedding_client = None if skip_embeddings else EmbeddingClient()
+    results: list[tuple[int, bool, str | None]] = []
+
+    async def worker(agregado_id: int) -> None:
+        async with semaphore:
+            try:
+                await ingest_agregado(
+                    agregado_id,
+                    client=client,
+                    embedding_client=embedding_client,
+                    generate_embeddings=not skip_embeddings,
+                    db_lock=db_lock,
+                )
+            except Exception as exc:  # noqa: BLE001
+                results.append((agregado_id, False, str(exc)[:200]))
+            else:
+                results.append((agregado_id, True, None))
+
+    try:
+        await asyncio.gather(*(worker(ag) for ag in agregado_ids))
+    finally:
+        await client.close()
+    return results
 
 
 def cmd_diagnostics_spot_check(args: argparse.Namespace) -> None:
@@ -150,6 +188,93 @@ def cmd_db_stats(args: argparse.Namespace) -> None:
     print(f"agregados_with_variables: {base_with_vars}/{base_total}")
     for table, count in stats.items():
         print(f"{table}: {count}")
+
+
+def cmd_ingest(args: argparse.Namespace) -> None:
+    _ensure_va_schema()
+    ids = [int(value) for value in args.agregado_ids]
+    if not ids:
+        return
+    results = asyncio.run(
+        _run_ingest(
+            ids,
+            concurrency=args.concurrent,
+            skip_embeddings=args.skip_embeddings,
+        )
+    )
+    successes = [ag for ag, ok, _ in results if ok]
+    failures = [(ag, detail) for ag, ok, detail in results if not ok]
+    for agregado_id in successes:
+        print(f"Ingested agregado {agregado_id}")
+    for agregado_id, detail in failures:
+        print(f"Failed agregado {agregado_id}: {detail or 'unknown error'}")
+    print(
+        f"Summary: {len(successes)} succeeded, {len(failures)} failed out of {len(results)} agregados"
+    )
+
+
+def cmd_ingest_coverage(args: argparse.Namespace) -> None:
+    _ensure_va_schema()
+
+    def _progress(message: str) -> None:
+        print(message)
+
+    report = asyncio.run(
+        ingest_by_coverage(
+            require_any_levels=args.any_levels,
+            require_all_levels=args.all_levels,
+            exclude_levels=args.exclude_levels,
+            subject_contains=args.subject_contains,
+            survey_contains=args.survey_contains,
+            limit=args.limit,
+            concurrency=args.concurrent,
+            skip_existing=args.skip_existing,
+            dry_run=args.dry_run,
+            generate_embeddings=not args.skip_embeddings,
+            progress_callback=_progress,
+        )
+    )
+
+    summary = {
+        "discovered": len(report.discovered_ids),
+        "scheduled": len(report.scheduled_ids),
+        "skipped_existing": len(report.skipped_existing),
+        "ingested": len(report.ingested_ids),
+        "failed": len(report.failed),
+        "dry_run": bool(args.dry_run),
+    }
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    if report.failed:
+        print("Failures:")
+        for agregado_id, detail in report.failed:
+            print(f"  {agregado_id}: {detail}")
+
+
+def cmd_repair_missing(args: argparse.Namespace) -> None:
+    _ensure_va_schema()
+    result = asyncio.run(
+        repair_missing_variables(
+            chunk_size=max(1, args.chunk),
+            concurrency=max(1, args.concurrent),
+            limit=args.limit,
+            max_retries=max(1, args.retries),
+        )
+    )
+    print(
+        json.dumps(
+            {
+                "attempted": result.attempted,
+                "succeeded": result.succeeded,
+                "failed": result.failed,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    if result.failures:
+        print("Failures:")
+        for agregado_id, detail in result.failures:
+            print(f"  {agregado_id}: {detail}")
 
 
 def cmd_index_build(args: argparse.Namespace) -> None:
@@ -347,6 +472,7 @@ def cmd_search_va(args: argparse.Namespace) -> None:
             args.query,
             filters=filters,
             limit=args.limit,
+            embedding_client=EmbeddingClient() if args.semantic else None,
         )
     )
     if not results:
@@ -612,6 +738,7 @@ def build_parser() -> argparse.ArgumentParser:
     search_va.add_argument("--must-category", action="append")
     search_va.add_argument("--min-municipalities", type=int)
     search_va.add_argument("--requires-national-munis", action="store_true")
+    search_va.add_argument("--semantic", action="store_true")
     search_va.add_argument("--json", action="store_true")
     search_va.set_defaults(func=cmd_search_va)
 
