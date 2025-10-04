@@ -4,7 +4,7 @@ import json
 from sidra_database.db import create_connection, ensure_schema
 
 from sidra_va.schema_migrations import apply_va_schema
-from sidra_va.value_index import build_va_index_for_agregado
+from sidra_va.value_index import build_va_index_for_agregado, build_va_index_for_all
 
 
 def _reset_tables(conn):
@@ -24,12 +24,7 @@ def _reset_tables(conn):
     conn.commit()
 
 
-def test_build_va_index_creates_rows():
-    ensure_schema()
-    conn = create_connection()
-    apply_va_schema(conn)
-    _reset_tables(conn)
-
+def _seed_sample_agregado(conn, agregado_id: int = 9999) -> None:
     raw_json = json.dumps(
         {
             "periodicidade": {"inicio": "2010", "fim": "2012"},
@@ -45,7 +40,7 @@ def test_build_va_index_creates_rows():
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            9999,
+            agregado_id,
             "População alfabetizada",
             "Censo",
             "Educação",
@@ -59,25 +54,25 @@ def test_build_va_index_creates_rows():
     )
     conn.execute(
         "INSERT INTO agregados_levels (agregado_id, level_id, level_name, level_type) VALUES (?, ?, ?, ?)",
-        (9999, "N3", "Estado", "N"),
+        (agregado_id, "N3", "Estado", "N"),
     )
     conn.execute(
         "INSERT INTO agregados_levels (agregado_id, level_id, level_name, level_type) VALUES (?, ?, ?, ?)",
-        (9999, "N6", "Município", "N"),
+        (agregado_id, "N6", "Município", "N"),
     )
     conn.execute(
         """
         INSERT INTO variables (id, agregado_id, nome, unidade, sumarizacao, text_hash)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (100, 9999, "Alfabetização", "%", "{}", "hash"),
+        (100, agregado_id, "Alfabetização", "%", "{}", "hash"),
     )
     conn.execute(
         """
         INSERT INTO classifications (id, agregado_id, nome, sumarizacao_status, sumarizacao_excecao)
         VALUES (?, ?, ?, ?, ?)
         """,
-        (10, 9999, "Cor ou raça", 0, None),
+        (10, agregado_id, "Cor ou raça", 0, None),
     )
     for cat_id, nome in [(1, "Branca"), (2, "Preta"), (3, "Indígena")]:
         conn.execute(
@@ -85,9 +80,19 @@ def test_build_va_index_creates_rows():
             INSERT INTO categories (agregado_id, classification_id, categoria_id, nome, unidade, nivel, text_hash)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (9999, 10, cat_id, nome, None, None, "hash"),
+            (agregado_id, 10, cat_id, nome, None, None, "hash"),
         )
     conn.commit()
+
+
+def test_build_va_index_creates_rows(tmp_path, monkeypatch):
+    db_path = tmp_path / "sidra.db"
+    monkeypatch.setenv("SIDRA_DATABASE_PATH", str(db_path))
+    ensure_schema()
+    conn = create_connection()
+    apply_va_schema(conn)
+    _reset_tables(conn)
+    _seed_sample_agregado(conn)
 
     created = asyncio.run(build_va_index_for_agregado(9999))
     assert created == 4
@@ -113,3 +118,17 @@ def test_build_va_index_creates_rows():
     assert fingerprint and len(fingerprint[0]) == 64
 
     conn.close()
+
+
+def test_build_va_index_for_all_serializes_writes(tmp_path, monkeypatch):
+    db_path = tmp_path / "sidra.db"
+    monkeypatch.setenv("SIDRA_DATABASE_PATH", str(db_path))
+    ensure_schema()
+    conn = create_connection()
+    apply_va_schema(conn)
+    _reset_tables(conn)
+    _seed_sample_agregado(conn)
+    conn.close()
+
+    results = asyncio.run(build_va_index_for_all(concurrency=1))
+    assert results == {"9999": 4}

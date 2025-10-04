@@ -1,11 +1,11 @@
-import sqlite3
-
 from sidra_database.db import create_connection, ensure_schema
 
 from sidra_va.schema_migrations import apply_va_schema, get_schema_version
 
 
-def test_apply_va_schema_idempotent(tmp_path):
+def test_apply_va_schema_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "sidra.db"
+    monkeypatch.setenv("SIDRA_DATABASE_PATH", str(db_path))
     conn = create_connection()
     try:
         ensure_schema(conn)
@@ -27,3 +27,9 @@ def test_apply_va_schema_idempotent(tmp_path):
             conn.execute(f"SELECT * FROM {table} LIMIT 0")
     finally:
         conn.close()
+
+    reopened = create_connection()
+    try:
+        assert get_schema_version(reopened) == 1
+    finally:
+        reopened.close()
