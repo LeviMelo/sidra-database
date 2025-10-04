@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import time
+from dataclasses import asdict
 from typing import Mapping, Sequence
 
 from .config import get_settings
@@ -14,6 +15,11 @@ from .bulk_ingest import ingest_by_coverage
 from .search import hybrid_search, SearchFilters
 from .catalog import list_agregados
 from .db import sqlite_session, ensure_schema
+from .diagnostics import (
+    api_vs_db_spot_check,
+    global_health_report,
+    repair_missing_variables,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -132,6 +138,60 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-embeddings",
         action="store_true",
         help="Skip embedding generation during ingestion",
+    )
+
+    diag_parser = subparsers.add_parser(
+        "diagnostics",
+        help="Run health checks against the SIDRA metadata store",
+    )
+    diag_sub = diag_parser.add_subparsers(dest="diagnostics_command", required=True)
+
+    diag_health = diag_sub.add_parser("health", help="Print global ingestion health stats")
+    diag_health.add_argument(
+        "--sample",
+        type=int,
+        default=50,
+        help="Number of missing-agregado IDs to include in the sample (default: 50)",
+    )
+
+    diag_spot = diag_sub.add_parser(
+        "spot-check",
+        help="Compare API metadata for agregados currently missing variables",
+    )
+    diag_spot.add_argument(
+        "--sample",
+        type=int,
+        default=10,
+        help="Number of agregados to sample for live API verification (default: 10)",
+    )
+
+    repair_parser = subparsers.add_parser(
+        "repair-missing",
+        help="Re-ingest agregados that currently have zero variables recorded",
+    )
+    repair_parser.add_argument(
+        "--chunk",
+        type=int,
+        default=50,
+        help="Number of agregados to process per batch (default: 50)",
+    )
+    repair_parser.add_argument(
+        "--concurrent",
+        type=int,
+        default=6,
+        help="Maximum concurrent ingestion tasks per batch (default: 6)",
+    )
+    repair_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit the number of agregados to re-ingest",
+    )
+    repair_parser.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        help="Number of retry attempts per batch (default: 3)",
     )
 
     search_parser = subparsers.add_parser("search", help="Run semantic search over stored embeddings")
@@ -448,6 +508,41 @@ def main(argv: Sequence[str] | None = None) -> None:
             for agregado_id, message in report.failed[:10]:
                 print(f"   {agregado_id}: {message[:180]}")
             if len(report.failed) > 10:
+                print("   ...")
+        return
+
+    if args.command == "diagnostics":
+        ensure_schema()
+        with sqlite_session() as conn:
+            if args.diagnostics_command == "health":
+                report = global_health_report(conn, sample_limit=args.sample)
+            elif args.diagnostics_command == "spot-check":
+                report = asyncio.run(
+                    api_vs_db_spot_check(conn, sample_size=args.sample)
+                )
+            else:
+                report = {}
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return
+
+    if args.command == "repair-missing":
+        ensure_schema()
+        result = asyncio.run(
+            repair_missing_variables(
+                chunk_size=args.chunk,
+                concurrency=args.concurrent,
+                limit=args.limit,
+                max_retries=args.retries,
+            )
+        )
+        payload = asdict(result)
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        if result.failures:
+            preview = result.failures[: min(10, len(result.failures))]
+            print("Failures:")
+            for agregado_id, message in preview:
+                print(f"   {agregado_id}: {message}")
+            if len(result.failures) > len(preview):
                 print("   ...")
         return
 

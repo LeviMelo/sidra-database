@@ -3,10 +3,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sqlite3
 from typing import Iterable
 
-from sidra_database.db import create_connection, ensure_schema
-
+from .db import create_connection
 from .embed import embed_vas_for_agregados
 from .neighbors import find_neighbors_for_va
 from .schema_migrations import apply_va_schema, get_schema_version
@@ -15,18 +15,75 @@ from .synonyms import export_synonyms_csv, import_synonyms_csv
 from .value_index import build_va_index_for_agregado, build_va_index_for_all
 
 
-def _ensure_base_schema() -> None:
+def _ensure_va_schema() -> None:
     conn = create_connection()
     try:
-        ensure_schema(conn)
         apply_va_schema(conn)
         conn.commit()
     finally:
         conn.close()
 
 
+def _base_counts(conn) -> tuple[int, int]:
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM agregados").fetchone()[0]
+    except sqlite3.OperationalError:
+        return 0, 0
+    try:
+        with_vars = conn.execute(
+            "SELECT COUNT(DISTINCT agregado_id) FROM variables"
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        with_vars = 0
+    return int(total or 0), int(with_vars or 0)
+
+
+def _require_base_metadata(
+    conn,
+    ids: Iterable[int] | None = None,
+) -> tuple[bool, list[int]]:
+    for table in ("agregados", "variables"):
+        try:
+            conn.execute(f"SELECT 1 FROM {table} LIMIT 1")
+        except sqlite3.OperationalError:
+            print(
+                f"Base table '{table}' is missing. Run 'sidra_database.cli ingest' before using sidra-va.",
+            )
+            return False, []
+
+    total, with_vars = _base_counts(conn)
+    if total == 0:
+        print("Database contains no agregados. Run 'sidra_database.cli ingest' first.")
+        return False, []
+    if with_vars == 0:
+        print(
+            "No agregados with variables found. Re-ingest metadata or run 'sidra_database.cli repair-missing'."
+        )
+        return False, []
+
+    zero_ids: list[int] = []
+    if ids:
+        for raw_id in ids:
+            agregado_id = int(raw_id)
+            count = conn.execute(
+                "SELECT COUNT(*) FROM variables WHERE agregado_id = ?",
+                (agregado_id,),
+            ).fetchone()[0]
+            if int(count or 0) == 0:
+                zero_ids.append(agregado_id)
+    return True, zero_ids
+
+
+def _count_rows(conn, table: str) -> int:
+    try:
+        row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    return int(row[0] or 0)
+
+
 def cmd_db_migrate(args: argparse.Namespace) -> None:
-    _ensure_base_schema()
+    _ensure_va_schema()
     conn = create_connection()
     try:
         version = get_schema_version(conn)
@@ -36,9 +93,10 @@ def cmd_db_migrate(args: argparse.Namespace) -> None:
 
 
 def cmd_db_stats(args: argparse.Namespace) -> None:
-    _ensure_base_schema()
+    _ensure_va_schema()
     conn = create_connection()
     try:
+        base_total, base_with_vars = _base_counts(conn)
         tables = [
             "value_atoms",
             "value_atom_dims",
@@ -48,16 +106,26 @@ def cmd_db_stats(args: argparse.Namespace) -> None:
         ]
         stats = {}
         for table in tables:
-            count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            stats[table] = count
+            stats[table] = _count_rows(conn, table)
     finally:
         conn.close()
+    print(f"agregados_with_variables: {base_with_vars}/{base_total}")
     for table, count in stats.items():
         print(f"{table}: {count}")
 
 
 def cmd_index_build(args: argparse.Namespace) -> None:
-    _ensure_base_schema()
+    _ensure_va_schema()
+    conn = create_connection()
+    try:
+        target_ids = args.ids if not args.all else None
+        ready, missing_ids = _require_base_metadata(conn, target_ids)
+    finally:
+        conn.close()
+
+    if not ready:
+        return
+
     if args.all:
         result = asyncio.run(
             build_va_index_for_all(
@@ -66,7 +134,9 @@ def cmd_index_build(args: argparse.Namespace) -> None:
             )
         )
         if not result:
-            print("No agregados found. Please ingest metadata first.")
+            print(
+                "No agregados with variables available. Ingest metadata before building the VA index."
+            )
         else:
             for ag, count in sorted(result.items()):
                 print(f"agregado {ag}: {count} VAs")
@@ -74,7 +144,16 @@ def cmd_index_build(args: argparse.Namespace) -> None:
 
     if not args.ids:
         raise SystemExit("Provide --ids or --all")
-    for ag_id in args.ids:
+
+    ready_ids = [ag for ag in args.ids if ag not in missing_ids]
+    for missing in missing_ids:
+        print(
+            f"No variables for table {missing}; run 'sidra_database.cli ingest {missing}' first."
+        )
+    if not ready_ids:
+        return
+
+    for ag_id in ready_ids:
         count = asyncio.run(
             build_va_index_for_agregado(
                 ag_id,
@@ -85,13 +164,35 @@ def cmd_index_build(args: argparse.Namespace) -> None:
 
 
 def cmd_index_embed(args: argparse.Namespace) -> None:
-    _ensure_base_schema()
-    ids = args.ids if not args.all else None
-    if ids is None and not args.all:
+    _ensure_va_schema()
+    requested_ids = args.ids if not args.all else None
+    conn = create_connection()
+    try:
+        ready, missing_ids = _require_base_metadata(conn, requested_ids)
+    finally:
+        conn.close()
+
+    if not ready:
+        return
+
+    if requested_ids is None and not args.all:
         raise SystemExit("Provide --ids or --all")
+
+    if requested_ids:
+        valid_ids = [ag for ag in requested_ids if ag not in missing_ids]
+        for missing in missing_ids:
+            print(
+                f"No variables for table {missing}; run 'sidra_database.cli ingest {missing}' first."
+            )
+    else:
+        valid_ids = None
+
+    if valid_ids is not None and not valid_ids:
+        return
+
     stats = asyncio.run(
         embed_vas_for_agregados(
-            ids,
+            valid_ids,
             concurrency=args.concurrent,
             model=args.model,
         )
@@ -103,9 +204,12 @@ def cmd_index_embed(args: argparse.Namespace) -> None:
 
 
 def cmd_index_rebuild_fts(args: argparse.Namespace) -> None:
-    _ensure_base_schema()
+    _ensure_va_schema()
     conn = create_connection()
     try:
+        ready, _ = _require_base_metadata(conn)
+        if not ready:
+            return
         rows = conn.execute("SELECT va_id, text, table_title, survey, subject FROM value_atoms").fetchall()
         with conn:
             conn.execute("DELETE FROM value_atoms_fts")
@@ -119,9 +223,12 @@ def cmd_index_rebuild_fts(args: argparse.Namespace) -> None:
 
 
 def cmd_synonyms_import(args: argparse.Namespace) -> None:
-    _ensure_base_schema()
+    _ensure_va_schema()
     conn = create_connection()
     try:
+        ready, _ = _require_base_metadata(conn)
+        if not ready:
+            return
         count = import_synonyms_csv(args.path, conn)
     finally:
         conn.close()
@@ -129,9 +236,12 @@ def cmd_synonyms_import(args: argparse.Namespace) -> None:
 
 
 def cmd_synonyms_export(args: argparse.Namespace) -> None:
-    _ensure_base_schema()
+    _ensure_va_schema()
     conn = create_connection()
     try:
+        ready, _ = _require_base_metadata(conn)
+        if not ready:
+            return
         count = export_synonyms_csv(args.path, conn)
     finally:
         conn.close()
@@ -174,7 +284,14 @@ def _parse_period(period: str | None) -> tuple[int | None, int | None]:
 
 
 def cmd_search_va(args: argparse.Namespace) -> None:
-    _ensure_base_schema()
+    _ensure_va_schema()
+    conn = create_connection()
+    try:
+        ready, _ = _require_base_metadata(conn)
+    finally:
+        conn.close()
+    if not ready:
+        return
     period_start, period_end = _parse_period(args.period)
     filters = VaSearchFilters(
         require_levels=tuple(args.require_level or []),
@@ -201,9 +318,17 @@ def cmd_search_va(args: argparse.Namespace) -> None:
 
 
 def cmd_show_table(args: argparse.Namespace) -> None:
-    _ensure_base_schema()
+    _ensure_va_schema()
     conn = create_connection()
     try:
+        ready, missing_ids = _require_base_metadata(conn, [args.agregado_id])
+        if not ready:
+            return
+        if missing_ids:
+            print(
+                f"No variables for table {args.agregado_id}; run 'sidra_database.cli ingest {args.agregado_id}' first."
+            )
+            return
         row = conn.execute(
             "SELECT id, nome, pesquisa, assunto, periodo_inicio, periodo_fim FROM agregados WHERE id = ?",
             (args.agregado_id,),
@@ -247,9 +372,12 @@ def cmd_show_table(args: argparse.Namespace) -> None:
 
 
 def cmd_show_va(args: argparse.Namespace) -> None:
-    _ensure_base_schema()
+    _ensure_va_schema()
     conn = create_connection()
     try:
+        ready, _ = _require_base_metadata(conn)
+        if not ready:
+            return
         row = conn.execute(
             "SELECT va_id, text FROM value_atoms WHERE va_id = ?",
             (args.va_id,),
@@ -263,7 +391,14 @@ def cmd_show_va(args: argparse.Namespace) -> None:
 
 
 def cmd_link_neighbors(args: argparse.Namespace) -> None:
-    _ensure_base_schema()
+    _ensure_va_schema()
+    conn = create_connection()
+    try:
+        ready, _ = _require_base_metadata(conn)
+    finally:
+        conn.close()
+    if not ready:
+        return
     neighbors = find_neighbors_for_va(
         args.va_id,
         top_k=args.top_k,
@@ -274,6 +409,69 @@ def cmd_link_neighbors(args: argparse.Namespace) -> None:
         return
     for result, score in neighbors:
         print(f"compat={score:.3f} {result.title} [{result.va_id}]")
+
+
+def cmd_diagnostics(args: argparse.Namespace) -> None:
+    _ensure_va_schema()
+    conn = create_connection()
+    try:
+        ready, _ = _require_base_metadata(conn)
+        base_total, base_with_vars = _base_counts(conn)
+        stats = {
+            "value_atoms": _count_rows(conn, "value_atoms"),
+            "value_atom_dims": _count_rows(conn, "value_atom_dims"),
+            "value_atoms_fts": _count_rows(conn, "value_atoms_fts"),
+            "variable_fingerprints": _count_rows(conn, "variable_fingerprints"),
+            "synonyms": _count_rows(conn, "synonyms"),
+        }
+        sample: list[dict[str, object]] = []
+        sample_limit = min(max(args.sample, 0), stats["value_atoms"])
+        if ready and sample_limit > 0:
+            cursor = conn.execute(
+                "SELECT va_id FROM value_atoms ORDER BY RANDOM() LIMIT ?",
+                (sample_limit,),
+            )
+            for row in cursor.fetchall():
+                dims_count = conn.execute(
+                    "SELECT COUNT(*) FROM value_atom_dims WHERE va_id = ?",
+                    (row["va_id"],),
+                ).fetchone()[0]
+                sample.append({"va_id": row["va_id"], "has_dims": bool(dims_count)})
+    finally:
+        conn.close()
+
+    diagnostics = {
+        "base": {
+            "ready": ready,
+            "agregados": base_total,
+            "agregados_with_variables": base_with_vars,
+        },
+        "tables": stats,
+        "fts_consistent": stats["value_atoms"] == stats["value_atoms_fts"],
+        "sample": sample,
+    }
+
+    smoke_query = args.smoke_query
+    smoke_results: list[str] = []
+    smoke_ok = False
+    if ready and stats["value_atoms"] > 0 and smoke_query:
+        results = asyncio.run(
+            search_value_atoms(
+                smoke_query,
+                filters=VaSearchFilters(),
+                limit=max(1, args.smoke_limit),
+            )
+        )
+        smoke_results = [item.va_id for item in results]
+        smoke_ok = bool(results)
+
+    diagnostics["smoke_test"] = {
+        "query": smoke_query,
+        "ok": smoke_ok,
+        "result_ids": smoke_results,
+    }
+
+    print(json.dumps(diagnostics, indent=2, ensure_ascii=False))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -350,6 +548,16 @@ def build_parser() -> argparse.ArgumentParser:
     neighbors_cmd.add_argument("--top-k", type=int, default=50)
     neighbors_cmd.add_argument("--allow-unit-mismatch", action="store_true")
     neighbors_cmd.set_defaults(func=cmd_link_neighbors)
+
+    diag_parser = subparsers.add_parser("diagnostics")
+    diag_parser.add_argument("--sample", type=int, default=5)
+    diag_parser.add_argument(
+        "--smoke-query",
+        default="população",
+        help="Query used for the search smoke test (default: população)",
+    )
+    diag_parser.add_argument("--smoke-limit", type=int, default=5)
+    diag_parser.set_defaults(func=cmd_diagnostics)
 
     return parser
 

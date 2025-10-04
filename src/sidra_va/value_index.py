@@ -5,8 +5,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict
 
-from sidra_database.db import create_connection, ensure_schema
-
+from .db import create_connection
 from .fingerprints import variable_fingerprint
 from .schema_migrations import apply_va_schema
 from .synonyms import SynonymMap, load_synonyms_into_memory
@@ -58,7 +57,6 @@ def _build_va_index_for_agregado_sync(
 ) -> int:
     conn = create_connection()
     try:
-        ensure_schema(conn)
         apply_va_schema(conn)
         conn.row_factory = dict_row_factory
         cursor = conn.execute(
@@ -70,6 +68,8 @@ def _build_va_index_for_agregado_sync(
             raise ValueError(f"Agregado {agregado_id} not found")
         _metadata = _decode_raw_json(row["raw_json"])
         variables = _load_variables(conn, agregado_id)
+        if not variables:
+            return 0
         classifications = _load_classifications(conn, agregado_id)
         levels = _load_levels(conn, agregado_id)
         synonyms = load_synonyms_into_memory(conn)
@@ -352,9 +352,10 @@ async def build_va_index_for_all(
 ) -> dict[str, int]:
     conn = create_connection()
     try:
-        ensure_schema(conn)
         apply_va_schema(conn)
-        cursor = conn.execute("SELECT id FROM agregados ORDER BY id")
+        cursor = conn.execute(
+            "SELECT DISTINCT agregado_id FROM variables ORDER BY agregado_id"
+        )
         ids = [row[0] for row in cursor.fetchall()]
     finally:
         conn.close()
