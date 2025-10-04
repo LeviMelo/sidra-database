@@ -8,8 +8,10 @@ from typing import Iterable
 
 from .db import create_connection
 from .embed import embed_vas_for_agregados
+from .embedding_client import EmbeddingClient
+from .ingest_base import ingest_agregado
 from .neighbors import find_neighbors_for_va
-from .schema_migrations import apply_va_schema, get_schema_version
+from .schema_migrations import get_schema_version
 from .search_va import VaResult, VaSearchFilters, search_value_atoms
 from .synonyms import export_synonyms_csv, import_synonyms_csv
 from .value_index import build_va_index_for_agregado, build_va_index_for_all
@@ -22,6 +24,42 @@ def _ensure_va_schema() -> None:
         conn.commit()
     finally:
         conn.close()
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+
+def cmd_diagnostics_spot_check(args: argparse.Namespace) -> None:
+    _ensure_va_schema()
+    conn = create_connection()
+    try:
+        report = asyncio.run(
+            api_vs_db_spot_check(
+                conn,
+                sample_size=max(0, args.spot_sample),
+            )
+        )
+    finally:
+        conn.close()
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+
+def cmd_list_agregados(args: argparse.Namespace) -> None:
+    _ensure_va_schema()
+    rows = list_agregados(
+        requires_national_munis=args.requires_national_munis,
+        min_municipality_count=args.min_municipalities,
+        limit=args.limit,
+        order_by=args.order,
+    )
+    if args.json:
+        print(json.dumps([asdict(row) for row in rows], indent=2, ensure_ascii=False))
+        return
+    for row in rows:
+        coverage = f"municipalities={row.municipality_locality_count}"
+        national = "national" if row.covers_national_municipalities else "partial"
+        print(
+            f"{row.id}: {row.nome} | assunto={row.assunto} | pesquisa={row.pesquisa} | "
+            f"{coverage} ({national})"
+        )
 
 
 def _base_counts(conn) -> tuple[int, int]:
@@ -486,6 +524,51 @@ def build_parser() -> argparse.ArgumentParser:
 
     stats = db_sub.add_parser("stats")
     stats.set_defaults(func=cmd_db_stats)
+
+    ingest_parser = subparsers.add_parser("ingest", help="Ingest one or more agregados")
+    ingest_parser.add_argument("agregado_ids", metavar="AGREGADO", type=int, nargs="+")
+    ingest_parser.add_argument("--concurrent", type=int, default=4)
+    ingest_parser.add_argument("--skip-embeddings", action="store_true")
+    ingest_parser.set_defaults(func=cmd_ingest)
+
+    coverage_parser = subparsers.add_parser(
+        "ingest-coverage",
+        help="Discover agregados by territorial coverage and ingest them",
+    )
+    coverage_parser.add_argument("--any-level", dest="any_levels", nargs="+", default=None)
+    coverage_parser.add_argument("--all-level", dest="all_levels", nargs="+", default=None)
+    coverage_parser.add_argument("--exclude-level", dest="exclude_levels", nargs="+", default=None)
+    coverage_parser.add_argument("--subject-contains", dest="subject_contains", default=None)
+    coverage_parser.add_argument("--survey-contains", dest="survey_contains", default=None)
+    coverage_parser.add_argument("--limit", type=int, default=None)
+    coverage_parser.add_argument("--concurrent", type=int, default=8)
+    coverage_parser.add_argument("--skip-embeddings", action="store_true")
+    coverage_parser.add_argument("--dry-run", action="store_true")
+    coverage_parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false")
+    coverage_parser.set_defaults(skip_existing=True)
+    coverage_parser.set_defaults(func=cmd_ingest_coverage)
+
+    repair_parser = subparsers.add_parser(
+        "repair-missing",
+        help="Re-ingest agregados that currently have zero variables",
+    )
+    repair_parser.add_argument("--chunk", type=int, default=50)
+    repair_parser.add_argument("--concurrent", type=int, default=6)
+    repair_parser.add_argument("--limit", type=int, default=None)
+    repair_parser.add_argument("--retries", type=int, default=3)
+    repair_parser.set_defaults(func=cmd_repair_missing)
+
+    list_parser = subparsers.add_parser("list", help="List stored agregados")
+    list_parser.add_argument("--requires-national-munis", action="store_true")
+    list_parser.add_argument("--min-municipalities", type=int, default=None)
+    list_parser.add_argument("--limit", type=int, default=None)
+    list_parser.add_argument(
+        "--order",
+        choices=["municipalities", "id", "name", "fetched"],
+        default="municipalities",
+    )
+    list_parser.add_argument("--json", action="store_true")
+    list_parser.set_defaults(func=cmd_list_agregados)
 
     index_parser = subparsers.add_parser("index")
     index_sub = index_parser.add_subparsers(dest="index_command")
