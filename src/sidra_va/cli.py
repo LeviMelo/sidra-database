@@ -20,6 +20,7 @@ def _ensure_base_schema() -> None:
     try:
         ensure_schema(conn)
         apply_va_schema(conn)
+        conn.commit()
     finally:
         conn.close()
 
@@ -295,7 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_va.add_argument("--ids", nargs="*", type=int)
     build_va.add_argument("--all", action="store_true")
     build_va.add_argument("--allow-two-dim-combos", action="store_true")
-    build_va.add_argument("--concurrent", type=int, default=6)
+    build_va.add_argument("--concurrent", type=int, default=1)
     build_va.set_defaults(func=cmd_index_build)
 
     embed_va = index_sub.add_parser("embed-va")

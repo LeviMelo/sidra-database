@@ -42,92 +42,93 @@ def apply_va_schema(connection: sqlite3.Connection) -> None:
     if current_version >= VA_SCHEMA_VERSION:
         return
 
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS value_atoms (
-          va_id TEXT PRIMARY KEY,
-          agregado_id INTEGER NOT NULL,
-          variable_id INTEGER NOT NULL,
-          unit TEXT,
-          text TEXT NOT NULL,
-          dims_json TEXT NOT NULL,
-          has_n1 INTEGER DEFAULT 0,
-          has_n2 INTEGER DEFAULT 0,
-          has_n3 INTEGER DEFAULT 0,
-          has_n6 INTEGER DEFAULT 0,
-          period_start TEXT,
-          period_end TEXT,
-          survey TEXT,
-          subject TEXT,
-          table_title TEXT,
-          created_at TEXT NOT NULL
+    with connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS value_atoms (
+              va_id TEXT PRIMARY KEY,
+              agregado_id INTEGER NOT NULL,
+              variable_id INTEGER NOT NULL,
+              unit TEXT,
+              text TEXT NOT NULL,
+              dims_json TEXT NOT NULL,
+              has_n1 INTEGER DEFAULT 0,
+              has_n2 INTEGER DEFAULT 0,
+              has_n3 INTEGER DEFAULT 0,
+              has_n6 INTEGER DEFAULT 0,
+              period_start TEXT,
+              period_end TEXT,
+              survey TEXT,
+              subject TEXT,
+              table_title TEXT,
+              created_at TEXT NOT NULL
+            )
+            """
         )
-        """
-    )
 
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS value_atom_dims (
-          va_id TEXT NOT NULL,
-          classification_id INTEGER NOT NULL,
-          classification_name TEXT NOT NULL,
-          category_id INTEGER NOT NULL,
-          category_name TEXT NOT NULL,
-          PRIMARY KEY (va_id, classification_id, category_id),
-          FOREIGN KEY (va_id) REFERENCES value_atoms(va_id)
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS value_atom_dims (
+              va_id TEXT NOT NULL,
+              classification_id INTEGER NOT NULL,
+              classification_name TEXT NOT NULL,
+              category_id INTEGER NOT NULL,
+              category_name TEXT NOT NULL,
+              PRIMARY KEY (va_id, classification_id, category_id),
+              FOREIGN KEY (va_id) REFERENCES value_atoms(va_id)
+            )
+            """
         )
-        """
-    )
 
-    connection.execute(
-        """
-        CREATE VIRTUAL TABLE IF NOT EXISTS value_atoms_fts
-        USING fts5(va_id UNINDEXED, text, table_title, survey, subject, tokenize='unicode61')
-        """
-    )
-
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS synonyms (
-          kind TEXT NOT NULL,
-          key TEXT NOT NULL,
-          alt TEXT NOT NULL,
-          PRIMARY KEY (kind, key, alt)
+        connection.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS value_atoms_fts
+            USING fts5(va_id UNINDEXED, text, table_title, survey, subject, tokenize='unicode61')
+            """
         )
-        """
-    )
 
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS variable_fingerprints (
-          variable_id INTEGER PRIMARY KEY,
-          fingerprint TEXT NOT NULL
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS synonyms (
+              kind TEXT NOT NULL,
+              key TEXT NOT NULL,
+              alt TEXT NOT NULL,
+              PRIMARY KEY (kind, key, alt)
+            )
+            """
         )
-        """
-    )
 
-    connection.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_value_atoms_agregado ON value_atoms(agregado_id)
-        """
-    )
-    connection.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_value_atoms_variable ON value_atoms(variable_id)
-        """
-    )
-    connection.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_value_atoms_levels ON value_atoms(has_n3, has_n6)
-        """
-    )
-    connection.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_value_atoms_period ON value_atoms(period_start, period_end)
-        """
-    )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS variable_fingerprints (
+              variable_id INTEGER PRIMARY KEY,
+              fingerprint TEXT NOT NULL
+            )
+            """
+        )
 
-    bump_schema_version(connection, VA_SCHEMA_VERSION)
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_value_atoms_agregado ON value_atoms(agregado_id)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_value_atoms_variable ON value_atoms(variable_id)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_value_atoms_levels ON value_atoms(has_n3, has_n6)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_value_atoms_period ON value_atoms(period_start, period_end)
+            """
+        )
+
+        bump_schema_version(connection, VA_SCHEMA_VERSION)
 
 
 __all__ = [

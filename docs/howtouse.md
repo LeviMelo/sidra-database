@@ -183,7 +183,34 @@ WHERE a.covers_national_municipalities = 1 AND a.id = 6579;
 | Missing coverage columns | `apply_schema` automatically adds new columns; rerun ingestion if you created the DB before upgrading. |
 | Wrong coverage flag | Adjust `SIDRA_MUNICIPALITY_NATIONAL_THRESHOLD` to suit your definition of "national" coverage. |
 
-## 9. Next Steps & Extensions
+## 9. Value Atom CLI Quickstart
+
+The Value Atom subsystem (`sidra_va`) shares the same SQLite database file as the core
+package. All commands respect `SIDRA_DATABASE_PATH`, so by default they operate on
+`sidra.db` in the repository root unless you override it.
+
+1. Initialise the additive schema:
+
+   ```powershell
+   python -m sidra_va.cli db migrate
+   # Outputs: VA schema version: 1
+   ```
+
+2. Build the VA index sequentially (safe default on Windows):
+
+   ```powershell
+   python -m sidra_va.cli index build-va --all --concurrent 1
+   ```
+
+   Increase `--concurrent` later if your environment tolerates more writer pressure.
+
+3. (Optional) Embed the generated Value Atoms using your configured embedding model:
+
+   ```powershell
+   python -m sidra_va.cli index embed-va --all --concurrent 6
+   ```
+
+## 10. Next Steps & Extensions
 - Add CLI support for ingestion ranges or manifest files.
 - Layer structured filters (period range, `assunto`, variable keywords) on top of the search command.
 - Integrate FAISS or sqlite-vss if embedding volume grows and you need faster searches.

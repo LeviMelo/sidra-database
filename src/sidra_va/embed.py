@@ -7,7 +7,7 @@ from sidra_database.db import create_connection, ensure_schema
 from sidra_database.embedding import EmbeddingClient
 
 from .schema_migrations import apply_va_schema
-from .utils import sha256_text, utcnow_iso
+from .utils import run_with_retries, sha256_text, utcnow_iso
 
 
 def _vector_to_blob(vector) -> bytes:
@@ -82,30 +82,33 @@ async def embed_vas_for_agregados(
                 return
 
             def _persist() -> None:
-                conn = create_connection()
-                try:
-                    ensure_schema(conn)
-                    apply_va_schema(conn)
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO embeddings (
-                            entity_type, entity_id, agregado_id, text_hash, model, dimension, vector, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            "va",
-                            va_id,
-                            agregado_id,
-                            text_hash,
-                            model_name,
-                            len(vector),
-                            _vector_to_blob(vector),
-                            utcnow_iso(),
-                        ),
-                    )
-                    conn.commit()
-                finally:
-                    conn.close()
+                def _write() -> None:
+                    conn = create_connection()
+                    try:
+                        ensure_schema(conn)
+                        apply_va_schema(conn)
+                        with conn:
+                            conn.execute(
+                                """
+                                INSERT OR REPLACE INTO embeddings (
+                                    entity_type, entity_id, agregado_id, text_hash, model, dimension, vector, created_at
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    "va",
+                                    va_id,
+                                    agregado_id,
+                                    text_hash,
+                                    model_name,
+                                    len(vector),
+                                    _vector_to_blob(vector),
+                                    utcnow_iso(),
+                                ),
+                            )
+                    finally:
+                        conn.close()
+
+                run_with_retries(_write)
 
             await asyncio.to_thread(_persist)
             stats["embedded"] += 1

@@ -3,14 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict
 
 from sidra_database.db import create_connection, ensure_schema
 
 from .fingerprints import variable_fingerprint
 from .schema_migrations import apply_va_schema
 from .synonyms import SynonymMap, load_synonyms_into_memory
-from .utils import json_dumps, sha256_text, utcnow_iso
+from .utils import json_dumps, run_with_retries, utcnow_iso
 
 TWO_DIM_ALLOWLIST: set[tuple[int, int]] = set()
 
@@ -68,7 +68,7 @@ def _build_va_index_for_agregado_sync(
         row = cursor.fetchone()
         if not row:
             raise ValueError(f"Agregado {agregado_id} not found")
-        metadata = _decode_raw_json(row["raw_json"])
+        _metadata = _decode_raw_json(row["raw_json"])
         variables = _load_variables(conn, agregado_id)
         classifications = _load_classifications(conn, agregado_id)
         levels = _load_levels(conn, agregado_id)
@@ -76,59 +76,58 @@ def _build_va_index_for_agregado_sync(
 
         created_at = utcnow_iso()
         total = 0
-        with conn:
-            for variable in variables:
-                base_va_id = f"{agregado_id}::v{variable.id}"
-                dims_json = []
-                va_text = _build_va_text(
-                    variable,
-                    dims_json,
-                    levels,
-                    row,
-                )
-                total += _upsert_va(
-                    conn,
-                    base_va_id,
-                    agregado_id,
-                    variable,
-                    dims_json,
-                    va_text,
-                    levels,
-                    row,
-                    created_at,
-                )
+        for variable in variables:
+            base_va_id = f"{agregado_id}::v{variable.id}"
+            dims_json: list[dict[str, Any]] = []
+            va_text = _build_va_text(
+                variable,
+                dims_json,
+                levels,
+                row,
+            )
+            total += _upsert_va(
+                conn,
+                base_va_id,
+                agregado_id,
+                variable,
+                dims_json,
+                va_text,
+                levels,
+                row,
+                created_at,
+            )
 
-                for classification in classifications:
-                    for category in classification.categories:
-                        dims_json = [
-                            {
-                                "classification_id": classification.id,
-                                "classification_name": classification.name,
-                                "category_id": category.id,
-                                "category_name": category.name,
-                            }
-                        ]
-                        suffix = f"c{classification.id}:{category.id}"
-                        va_id = f"{base_va_id}::{suffix}"
-                        va_text = _build_va_text(
-                            variable,
-                            dims_json,
-                            levels,
-                            row,
-                        )
-                        total += _upsert_va(
-                            conn,
-                            va_id,
-                            agregado_id,
-                            variable,
-                            dims_json,
-                            va_text,
-                            levels,
-                            row,
-                            created_at,
-                        )
+            for classification in classifications:
+                for category in classification.categories:
+                    dims_json = [
+                        {
+                            "classification_id": classification.id,
+                            "classification_name": classification.name,
+                            "category_id": category.id,
+                            "category_name": category.name,
+                        }
+                    ]
+                    suffix = f"c{classification.id}:{category.id}"
+                    va_id = f"{base_va_id}::{suffix}"
+                    va_text = _build_va_text(
+                        variable,
+                        dims_json,
+                        levels,
+                        row,
+                    )
+                    total += _upsert_va(
+                        conn,
+                        va_id,
+                        agregado_id,
+                        variable,
+                        dims_json,
+                        va_text,
+                        levels,
+                        row,
+                        created_at,
+                    )
 
-                _upsert_fingerprint(conn, variable, synonyms)
+            _upsert_fingerprint(conn, variable, synonyms)
         return total
     finally:
         conn.close()
@@ -184,89 +183,100 @@ def _upsert_va(
     has_n2 = 1 if "N2" in levels else 0
     has_n3 = 1 if "N3" in levels else 0
     has_n6 = 1 if "N6" in levels else 0
-    conn.execute(
-        """
-        INSERT INTO value_atoms (
-            va_id, agregado_id, variable_id, unit, text, dims_json,
-            has_n1, has_n2, has_n3, has_n6, period_start, period_end,
-            survey, subject, table_title, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(va_id) DO UPDATE SET
-            agregado_id=excluded.agregado_id,
-            variable_id=excluded.variable_id,
-            unit=excluded.unit,
-            text=excluded.text,
-            dims_json=excluded.dims_json,
-            has_n1=excluded.has_n1,
-            has_n2=excluded.has_n2,
-            has_n3=excluded.has_n3,
-            has_n6=excluded.has_n6,
-            period_start=excluded.period_start,
-            period_end=excluded.period_end,
-            survey=excluded.survey,
-            subject=excluded.subject,
-            table_title=excluded.table_title
-        """,
-        (
-            va_id,
-            agregado_id,
-            variable.id,
-            variable.unit,
-            va_text,
-            json_dumps(dims_json),
-            has_n1,
-            has_n2,
-            has_n3,
-            has_n6,
-            agreg_row.get("periodo_inicio"),
-            agreg_row.get("periodo_fim"),
-            agreg_row.get("pesquisa"),
-            agreg_row.get("assunto"),
-            agreg_row.get("nome"),
-            created_at,
-        ),
-    )
-
-    conn.execute("DELETE FROM value_atoms_fts WHERE va_id = ?", (va_id,))
-    conn.execute(
-        "INSERT INTO value_atoms_fts(va_id, text, table_title, survey, subject) VALUES(?,?,?,?,?)",
-        (
-            va_id,
-            va_text,
-            agreg_row.get("nome"),
-            agreg_row.get("pesquisa"),
-            agreg_row.get("assunto"),
-        ),
-    )
-
-    conn.execute("DELETE FROM value_atom_dims WHERE va_id = ?", (va_id,))
-    if dims_json:
-        conn.executemany(
-            """
-            INSERT INTO value_atom_dims(
-                va_id, classification_id, classification_name, category_id, category_name
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            [
+    def _write() -> None:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO value_atoms (
+                    va_id, agregado_id, variable_id, unit, text, dims_json,
+                    has_n1, has_n2, has_n3, has_n6, period_start, period_end,
+                    survey, subject, table_title, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(va_id) DO UPDATE SET
+                    agregado_id=excluded.agregado_id,
+                    variable_id=excluded.variable_id,
+                    unit=excluded.unit,
+                    text=excluded.text,
+                    dims_json=excluded.dims_json,
+                    has_n1=excluded.has_n1,
+                    has_n2=excluded.has_n2,
+                    has_n3=excluded.has_n3,
+                    has_n6=excluded.has_n6,
+                    period_start=excluded.period_start,
+                    period_end=excluded.period_end,
+                    survey=excluded.survey,
+                    subject=excluded.subject,
+                    table_title=excluded.table_title
+                """,
                 (
                     va_id,
-                    dim["classification_id"],
-                    dim["classification_name"],
-                    dim["category_id"],
-                    dim["category_name"],
+                    agregado_id,
+                    variable.id,
+                    variable.unit,
+                    va_text,
+                    json_dumps(dims_json),
+                    has_n1,
+                    has_n2,
+                    has_n3,
+                    has_n6,
+                    agreg_row.get("periodo_inicio"),
+                    agreg_row.get("periodo_fim"),
+                    agreg_row.get("pesquisa"),
+                    agreg_row.get("assunto"),
+                    agreg_row.get("nome"),
+                    created_at,
+                ),
+            )
+
+            conn.execute("DELETE FROM value_atoms_fts WHERE va_id = ?", (va_id,))
+            conn.execute(
+                "INSERT INTO value_atoms_fts(va_id, text, table_title, survey, subject) VALUES(?,?,?,?,?)",
+                (
+                    va_id,
+                    va_text,
+                    agreg_row.get("nome"),
+                    agreg_row.get("pesquisa"),
+                    agreg_row.get("assunto"),
+                ),
+            )
+
+            conn.execute("DELETE FROM value_atom_dims WHERE va_id = ?", (va_id,))
+            if dims_json:
+                conn.executemany(
+                    """
+                    INSERT INTO value_atom_dims(
+                        va_id, classification_id, classification_name, category_id, category_name
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            va_id,
+                            dim["classification_id"],
+                            dim["classification_name"],
+                            dim["category_id"],
+                            dim["category_name"],
+                        )
+                        for dim in dims_json
+                    ],
                 )
-                for dim in dims_json
-            ],
-        )
+
+    run_with_retries(_write)
     return 1
 
 
 def _upsert_fingerprint(conn, variable: _Variable, synonyms: SynonymMap) -> None:
     fingerprint = variable_fingerprint(variable.name, variable.unit, synonyms)
-    conn.execute(
-        "INSERT OR REPLACE INTO variable_fingerprints(variable_id, fingerprint) VALUES(?, ?)",
-        (variable.id, fingerprint),
+    run_with_retries(
+        lambda: _write_fingerprint(conn, variable.id, fingerprint)
     )
+
+
+def _write_fingerprint(conn, variable_id: int, fingerprint: str) -> None:
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO variable_fingerprints(variable_id, fingerprint) VALUES(?, ?)",
+            (variable_id, fingerprint),
+        )
 
 
 def _load_variables(conn, agregado_id: int) -> list[_Variable]:
@@ -337,7 +347,7 @@ def dict_row_factory(cursor, row):
 
 async def build_va_index_for_all(
     *,
-    concurrency: int = 6,
+    concurrency: int = 1,
     allow_two_dim_combos: bool = False,
 ) -> dict[str, int]:
     conn = create_connection()

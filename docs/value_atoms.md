@@ -29,8 +29,14 @@ lives alongside the original modules and can be adopted incrementally.
 
 ```bash
 python -m sidra_va.cli db migrate
-python -m sidra_va.cli index build-va --all
+# -> VA schema version: 1
+python -m sidra_va.cli index build-va --all --concurrent 1
 ```
+
+The migration prints the schema version after it completes. Seeing `VA schema version: 1`
+confirms that the additive tables were created and committed. The build command runs one
+table at a time by default (`--concurrent 1`), which avoids SQLite write locks on
+Windows. You can increase the value if your environment tolerates more concurrency.
 
 3. (Optional) Embed Value Atoms for semantic search:
 
@@ -69,6 +75,10 @@ python -m sidra_va.cli index synonyms export current_synonyms.csv
 
 The CSV must contain the columns `kind,key,alt` where `kind` is one of
 `classification`, `category`, `variable` or `unit`.
+
+> **Tip:** All `sidra_va` commands honour the same `SIDRA_DATABASE_PATH` environment
+> variable as the main package. If unset, the SQLite file defaults to `sidra.db` in the
+> repository root.
 
 ## Neighbor Discovery (Concatenation)
 
