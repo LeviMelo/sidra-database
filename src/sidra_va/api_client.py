@@ -44,9 +44,14 @@ class SidraApiClient:
     )
     async def _get_json(self, path: str, params: Mapping[str, Any] | None = None) -> Any:
         response = await self._client.get(path, params=params)
-        if response.status_code >= 400:
+        status = response.status_code
+        if status == 429 or status >= 500:
             raise SidraApiError(
-                f"SIDRA API request failed ({response.status_code}): {response.text[:200]}"
+                f"SIDRA API request failed ({status}): {response.text[:200]}"
+            )
+        if status >= 400:
+            raise RuntimeError(
+                f"SIDRA API request failed ({status}): {response.text[:200]}"
             )
         return orjson.loads(response.content)
 

@@ -12,9 +12,12 @@ class VaSettings:
 
     embedding_api_url: str = "http://127.0.0.1:1234/v1/embeddings"
     embedding_model: str = "text-embedding-qwen3-embedding-0.6b@f16"
+    sidra_base_url: str = "https://servicodados.ibge.gov.br/api/v3/agregados"
     request_timeout: float = 30.0
+    request_retries: int = 3
     user_agent: str = "sidra-va/0.1"
     database_timeout: float = 60.0
+    municipality_national_threshold: int = 0
 
 
 def _lookup_env(name: str) -> str | None:
@@ -29,7 +32,7 @@ def _load_settings() -> VaSettings:
     defaults = VaSettings()
     prefix = "SIDRA_VA_"
     overrides: dict[str, object] = {}
-    for field in ("embedding_api_url", "embedding_model", "user_agent"):
+    for field in ("embedding_api_url", "embedding_model", "user_agent", "sidra_base_url"):
         value = _lookup_env(f"{prefix}{field.upper()}")
         if value:
             overrides[field] = value
@@ -43,6 +46,18 @@ def _load_settings() -> VaSettings:
     if db_timeout_raw:
         try:
             overrides["database_timeout"] = float(db_timeout_raw)
+        except ValueError:
+            pass
+    retries_raw = _lookup_env(f"{prefix}REQUEST_RETRIES")
+    if retries_raw:
+        try:
+            overrides["request_retries"] = max(1, int(retries_raw))
+        except ValueError:
+            pass
+    muni_threshold_raw = _lookup_env(f"{prefix}MUNICIPALITY_NATIONAL_THRESHOLD")
+    if muni_threshold_raw:
+        try:
+            overrides["municipality_national_threshold"] = max(0, int(muni_threshold_raw))
         except ValueError:
             pass
     if overrides:

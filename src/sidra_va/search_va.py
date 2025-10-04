@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import math
 from array import array
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, Sequence
+from typing import Dict, Mapping, Sequence
 
 from .db import create_connection
 from .embedding_client import EmbeddingClient
@@ -74,6 +73,54 @@ def _cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _structural_candidate_ids(conn, filters: VaSearchFilters) -> set[str] | None:
+    relevant = False
+    conditions: list[str] = []
+    params: list[object] = []
+
+    level_map = {"N1": "has_n1", "N2": "has_n2", "N3": "has_n3", "N6": "has_n6"}
+    for level in filters.require_levels:
+        column = level_map.get(level.upper())
+        if column:
+            relevant = True
+            conditions.append(f"va.{column} = 1")
+
+    if filters.period_start is not None:
+        relevant = True
+        conditions.append(
+            "CAST(COALESCE(NULLIF(va.period_end, ''), NULLIF(va.period_start, ''), '0') AS INTEGER) >= ?"
+        )
+        params.append(filters.period_start)
+
+    if filters.period_end is not None:
+        relevant = True
+        conditions.append(
+            "CAST(COALESCE(NULLIF(va.period_start, ''), NULLIF(va.period_end, ''), '0') AS INTEGER) <= ?"
+        )
+        params.append(filters.period_end)
+
+    if filters.min_municipalities is not None:
+        relevant = True
+        conditions.append("COALESCE(ag.municipality_locality_count, 0) >= ?")
+        params.append(filters.min_municipalities)
+
+    if filters.requires_national_munis:
+        relevant = True
+        conditions.append("ag.covers_national_municipalities = 1")
+
+    if not relevant:
+        return None
+
+    query = (
+        "SELECT va.va_id FROM value_atoms AS va "
+        "JOIN agregados AS ag ON ag.id = va.agregado_id"
+    )
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    cursor = conn.execute(query, tuple(params))
+    return {row[0] for row in cursor.fetchall()}
+
+
 async def search_value_atoms(
     query: str,
     *,
@@ -100,31 +147,56 @@ async def search_value_atoms(
             )
             lexical_candidates = [row[0] for row in cursor.fetchall()]
         lexical_ranks = {va_id: idx + 1 for idx, va_id in enumerate(lexical_candidates)}
+        lexical_rrf_scores = rrf(lexical_ranks)
 
         semantic_ranks: Dict[str, int] = {}
+        semantic_rrf_scores: Dict[str, float] = {}
         query_vector: list[float] | None = None
+        structural_candidates = _structural_candidate_ids(conn, filters)
+        embedding_candidate_ids: set[str] | None = None
+        if structural_candidates is not None:
+            embedding_candidate_ids = set(structural_candidates)
+        if lexical_candidates:
+            if embedding_candidate_ids is None:
+                embedding_candidate_ids = set(lexical_candidates)
+            else:
+                embedding_candidate_ids.update(lexical_candidates)
         if embedding_client is not None:
             query_vector = await asyncio.to_thread(
                 embedding_client.embed_text,
                 query,
                 model=embedding_client.model,
             )
-            cursor = conn.execute(
+            sql = (
                 """
                 SELECT entity_id, agregado_id, dimension, vector
                 FROM embeddings
                 WHERE entity_type = 'va' AND model = ?
-                """,
-                (embedding_client.model,),
+                """
             )
+            params: list[object] = [embedding_client.model]
+            cursor = None
+            if embedding_candidate_ids is not None:
+                if embedding_candidate_ids:
+                    ordered_ids = sorted(embedding_candidate_ids)
+                    placeholders = ",".join("?" for _ in ordered_ids)
+                    sql += f" AND entity_id IN ({placeholders})"
+                    params.extend(ordered_ids)
+                    cursor = conn.execute(sql, tuple(params))
+            else:
+                cursor = conn.execute(sql, (embedding_client.model,))
+
             similarities: list[tuple[str, float]] = []
-            for row in cursor.fetchall():
-                vector = _blob_to_vector(row["vector"], row["dimension"])
-                sim = _cosine_similarity(query_vector, vector)
-                if sim > 0:
-                    similarities.append((row["entity_id"], sim))
+            if cursor is not None:
+                for row in cursor.fetchall():
+                    vector = _blob_to_vector(row["vector"], row["dimension"])
+                    sim = _cosine_similarity(query_vector, vector)
+                    if sim > 0:
+                        similarities.append((row["entity_id"], sim))
             similarities.sort(key=lambda item: item[1], reverse=True)
-            semantic_ranks = {va_id: idx + 1 for idx, (va_id, _) in enumerate(similarities[: limit * 5])}
+            top_semantic = similarities[: limit * 5]
+            semantic_ranks = {va_id: idx + 1 for idx, (va_id, _) in enumerate(top_semantic)}
+            semantic_rrf_scores = rrf(semantic_ranks)
 
         all_candidate_ids = set(lexical_ranks) | set(semantic_ranks)
         if not all_candidate_ids:
@@ -168,16 +240,9 @@ async def search_value_atoms(
             continue
         struct = _compute_structure_score(row, dims, filters, query_tokens)
         struct_score = struct.score()
-        rrf_scores = 0.0
-        rank_inputs = {}
-        if row["va_id"] in lexical_ranks:
-            rank_inputs[row["va_id"]] = lexical_ranks[row["va_id"]]
-        if row["va_id"] in semantic_ranks:
-            rank_inputs[row["va_id"]] = min(
-                semantic_ranks[row["va_id"]], rank_inputs.get(row["va_id"], semantic_ranks[row["va_id"]])
-            )
-        if rank_inputs:
-            rrf_scores = sum(rrf(rank_inputs).values())
+        lexical_rrf = lexical_rrf_scores.get(row["va_id"], 0.0)
+        semantic_rrf = semantic_rrf_scores.get(row["va_id"], 0.0)
+        rrf_scores = lexical_rrf + semantic_rrf
         combined = weight_cfg.get("struct", 0.7) * struct_score + weight_cfg.get("rrf", 0.3) * rrf_scores
         title = row["variable_name"]
         if dims:

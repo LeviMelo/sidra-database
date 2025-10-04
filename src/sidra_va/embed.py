@@ -46,9 +46,9 @@ async def embed_vas_for_agregados(
         return {"embedded": 0, "skipped": 0, "failed": 0}
 
     semaphore = asyncio.Semaphore(concurrency)
-    stats = {"embedded": 0, "skipped": 0, "failed": 0}
 
     async def _process(target):
+        outcome = {"embedded": 0, "skipped": 0, "failed": 0}
         va_id, agregado_id, text = target
         text_hash = sha256_text(text)
 
@@ -66,17 +66,21 @@ async def embed_vas_for_agregados(
             finally:
                 conn.close()
 
-        should_embed = await asyncio.to_thread(_should_embed)
+        try:
+            should_embed = await asyncio.to_thread(_should_embed)
+        except Exception:
+            outcome["failed"] += 1
+            return outcome
         if not should_embed:
-            stats["skipped"] += 1
-            return
+            outcome["skipped"] += 1
+            return outcome
 
         async with semaphore:
             try:
                 vector = await asyncio.to_thread(client.embed_text, text, model=model_name)
             except Exception:
-                stats["failed"] += 1
-                return
+                outcome["failed"] += 1
+                return outcome
 
         def _persist() -> None:
             conn = create_connection()
@@ -107,11 +111,20 @@ async def embed_vas_for_agregados(
             finally:
                 conn.close()
 
-        await asyncio.to_thread(_persist)
-        stats["embedded"] += 1
+        try:
+            await asyncio.to_thread(_persist)
+        except Exception:
+            outcome["failed"] += 1
+        else:
+            outcome["embedded"] += 1
+        return outcome
 
-    await asyncio.gather(*[_process(target) for target in targets])
-    return stats
+    results = await asyncio.gather(*(_process(target) for target in targets))
+    aggregated = {"embedded": 0, "skipped": 0, "failed": 0}
+    for result in results:
+        for key in aggregated:
+            aggregated[key] += result.get(key, 0)
+    return aggregated
 
 
 __all__ = ["embed_vas_for_agregados"]

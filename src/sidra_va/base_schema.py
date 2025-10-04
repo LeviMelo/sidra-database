@@ -85,19 +85,6 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS embeddings (
-        entity_type TEXT NOT NULL,
-        entity_id TEXT NOT NULL,
-        agregado_id INTEGER,
-        text_hash TEXT NOT NULL,
-        model TEXT NOT NULL,
-        dimension INTEGER NOT NULL,
-        vector BLOB NOT NULL,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY (entity_type, entity_id, model)
-    )
-    """,
-    """
     CREATE TABLE IF NOT EXISTS ingestion_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         agregado_id INTEGER NOT NULL,
@@ -116,9 +103,6 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
     CREATE INDEX IF NOT EXISTS idx_localities_agregado ON localities(agregado_id, level_id)
     """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_embeddings_agregado ON embeddings(agregado_id, model)
-    """
 )
 
 ADDITIONAL_COLUMNS: tuple[tuple[str, str, str], ...] = (
