@@ -12,7 +12,7 @@ import orjson
 from .api_client import SidraApiClient
 from .config import get_settings
 from .db import sqlite_session
-from .embedding import EmbeddingClient
+from .embedding_client import EmbeddingClient
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 MUNICIPALITY_LEVEL_CODE = "N6"
