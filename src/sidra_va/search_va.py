@@ -7,9 +7,8 @@ from array import array
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Mapping, Sequence
 
-from sidra_database.db import create_connection, ensure_schema
-from sidra_database.embedding import EmbeddingClient
-
+from .db import create_connection
+from .embedding_client import EmbeddingClient
 from .schema_migrations import apply_va_schema
 from .scoring import DEFAULT_WEIGHTS, StructureMatch, rrf
 from .synonyms import SynonymMap, load_synonyms_into_memory, normalize_basic
@@ -88,7 +87,6 @@ async def search_value_atoms(
 
     conn = create_connection()
     try:
-        ensure_schema(conn)
         apply_va_schema(conn)
         synonyms = load_synonyms_into_memory(conn)
 

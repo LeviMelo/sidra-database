@@ -11,7 +11,7 @@ import orjson
 
 from .api_client import SidraApiClient
 from .config import get_settings
-from .db import ensure_schema, sqlite_session
+from .db import sqlite_session
 from .embedding import EmbeddingClient
 
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -224,9 +224,26 @@ async def ingest_agregado(
     else:
         embedding_client = None
     try:
-        metadata = await client.fetch_metadata(agregado_id)
-        periods = await client.fetch_periods(agregado_id)
-        nivel_groups: dict[str, list[str]] = metadata.get("nivelTerritorial", {}) or {}
+        try:
+            raw_metadata = await client.fetch_metadata(agregado_id)
+        except Exception:
+            _log_ingestion_status(agregado_id, "error", "api")
+            raise
+
+        try:
+            metadata = _validate_metadata_payload(raw_metadata)
+        except IngestionValidationError:
+            _log_ingestion_status(agregado_id, "error", "validation")
+            raise
+
+        try:
+            periods = await client.fetch_periods(agregado_id)
+        except Exception:
+            _log_ingestion_status(agregado_id, "error", "api")
+            raise
+
+        nivel_groups_raw = metadata.get("nivelTerritorial", {}) or {}
+        nivel_groups = nivel_groups_raw if isinstance(nivel_groups_raw, dict) else {}
 
         municipality_locality_count: int = 0
         level_rows: list[tuple[int, str, str | None, str, int]] = []
@@ -235,17 +252,25 @@ async def ingest_agregado(
             if not codes:
                 continue
             for level_code in codes:
-                localities = await client.fetch_localities(agregado_id, level_code)
-                payload = list(localities)
+                try:
+                    localities = await client.fetch_localities(agregado_id, level_code)
+                except Exception:
+                    _log_ingestion_status(agregado_id, "error", "api")
+                    raise
+                raw_payload = localities or []
+                if isinstance(raw_payload, list):
+                    payload = raw_payload
+                else:
+                    try:
+                        payload = list(raw_payload)
+                    except TypeError:
+                        payload = []
                 count = len(payload)
-                if level_code.upper() == MUNICIPALITY_LEVEL_CODE:
-                    if count > municipality_locality_count:
-                        municipality_locality_count = count
+                if level_code.upper() == MUNICIPALITY_LEVEL_CODE and count > municipality_locality_count:
+                    municipality_locality_count = count
                 level_name = None
                 if payload:
-                    level_name = (
-                        payload[0].get("nivel", {}) or {}
-                    ).get("nome")
+                    level_name = (payload[0].get("nivel", {}) or {}).get("nome")
                 level_rows.append(
                     (
                         agregado_id,
@@ -271,173 +296,186 @@ async def ingest_agregado(
         else:
             covers_national_munis = 1 if municipality_locality_count >= threshold_setting else 0
 
+        variables_payload = metadata.get("variaveis") or []
+        variable_rows: list[tuple[Any, int, Any, Any, str, str]] = []
+        for variable in variables_payload:
+            variable_rows.append(
+                (
+                    variable.get("id"),
+                    agregado_id,
+                    variable.get("nome"),
+                    variable.get("unidade"),
+                    _json_dump_text(variable.get("sumarizacao", [])),
+                    _hash_text(
+                        str(variable.get("id")),
+                        variable.get("nome", ""),
+                        variable.get("unidade", ""),
+                    ),
+                )
+            )
+
+        classification_rows: list[tuple[int, int, str | None, int, str]] = []
+        category_rows: list[tuple[int, int, int, str | None, str | None, Any, str]] = []
+        for classificacao in metadata.get("classificacoes", []) or []:
+            cid = classificacao.get("id")
+            classification_rows.append(
+                (
+                    cid,
+                    agregado_id,
+                    classificacao.get("nome"),
+                    1 if (classificacao.get("sumarizacao", {}).get("status")) else 0,
+                    _json_dump_text(classificacao.get("sumarizacao", {}).get("excecao", [])),
+                )
+            )
+            for categoria in classificacao.get("categorias", []) or []:
+                category_rows.append(
+                    (
+                        agregado_id,
+                        cid,
+                        categoria.get("id"),
+                        categoria.get("nome"),
+                        categoria.get("unidade"),
+                        categoria.get("nivel"),
+                        _hash_text(
+                            str(cid),
+                            str(categoria.get("id")),
+                            categoria.get("nome", ""),
+                            categoria.get("unidade", ""),
+                        ),
+                    )
+                )
+
+        period_rows: list[tuple[int, str, str, Any]] = []
+        for period in periods or []:
+            pid = period.get("id") if isinstance(period, dict) else period
+            literals = period.get("literals", [pid]) if isinstance(period, dict) else [period]
+            modificacao = period.get("modificacao") if isinstance(period, dict) else None
+            period_rows.append((agregado_id, str(pid), _json_dump_text(literals), modificacao))
+
         embedding_targets: list[_EmbeddingTarget] = []
         if generate_embeddings:
             embedding_targets = _build_embedding_targets(agregado_id, metadata)
+
         fetched_at = _utcnow()
+
         async def _write_to_database() -> None:
             with sqlite_session() as conn:
                 conn.execute("BEGIN")
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO agregados (
-                        id, nome, pesquisa, assunto, url, freq, periodo_inicio, periodo_fim, raw_json, fetched_at,
-                        municipality_locality_count, covers_national_municipalities
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        metadata.get("id"),
-                        metadata.get("nome"),
-                        metadata.get("pesquisa"),
-                        metadata.get("assunto"),
-                        metadata.get("URL"),
-                        metadata.get("periodicidade", {}).get("frequencia"),
-                        metadata.get("periodicidade", {}).get("inicio"),
-                        metadata.get("periodicidade", {}).get("fim"),
-                        _json_dumps(metadata),
-                        fetched_at,
-                        municipality_locality_count,
-                        covers_national_munis,
-                    ),
-                )
-
-                conn.execute("DELETE FROM agregados_levels WHERE agregado_id = ?", (agregado_id,))
-                if level_rows:
-                    conn.executemany(
+                try:
+                    conn.execute(
                         """
-                        INSERT OR REPLACE INTO agregados_levels (
-                            agregado_id, level_id, level_name, level_type, locality_count
-                        ) VALUES (?, ?, ?, ?, ?)
+                        INSERT OR REPLACE INTO agregados (
+                            id, nome, pesquisa, assunto, url, freq, periodo_inicio, periodo_fim, raw_json, fetched_at,
+                            municipality_locality_count, covers_national_municipalities
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        level_rows,
-                    )
-
-                variables = metadata.get("variaveis", []) or []
-                conn.execute("DELETE FROM variables WHERE agregado_id = ?", (agregado_id,))
-                variable_rows = [
-                    (
-                        variable.get("id"),
-                        agregado_id,
-                        variable.get("nome"),
-                        variable.get("unidade"),
-                        _json_dump_text(variable.get("sumarizacao", [])),
-                        _hash_text(
-                            str(variable.get("id")),
-                            variable.get("nome", ""),
-                            variable.get("unidade", ""),
+                        (
+                            metadata.get("id"),
+                            metadata.get("nome"),
+                            metadata.get("pesquisa"),
+                            metadata.get("assunto"),
+                            metadata.get("URL"),
+                            metadata.get("periodicidade", {}).get("frequencia"),
+                            metadata.get("periodicidade", {}).get("inicio"),
+                            metadata.get("periodicidade", {}).get("fim"),
+                            _json_dumps(metadata),
+                            fetched_at,
+                            municipality_locality_count,
+                            covers_national_munis,
                         ),
                     )
-                    for variable in variables
-                ]
-                if variable_rows:
-                    conn.executemany(
-                        """
-                        INSERT OR REPLACE INTO variables (
-                            id, agregado_id, nome, unidade, sumarizacao, text_hash
-                        ) VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                        variable_rows,
-                    )
 
-                conn.execute("DELETE FROM classifications WHERE agregado_id = ?", (agregado_id,))
-                conn.execute("DELETE FROM categories WHERE agregado_id = ?", (agregado_id,))
-                classification_rows: list[tuple[int, int, str | None, int, str]] = []
-                category_rows: list[tuple[int, int, int, str | None, str | None, Any, str]] = []
-                for classificacao in metadata.get("classificacoes", []) or []:
-                    cid = classificacao.get("id")
-                    classification_rows.append(
-                        (
-                            cid,
-                            agregado_id,
-                            classificacao.get("nome"),
-                            1 if (classificacao.get("sumarizacao", {}).get("status")) else 0,
-                            _json_dump_text(classificacao.get("sumarizacao", {}).get("excecao", [])),
+                    if level_rows:
+                        conn.execute("DELETE FROM agregados_levels WHERE agregado_id = ?", (agregado_id,))
+                        conn.executemany(
+                            """
+                            INSERT OR REPLACE INTO agregados_levels (
+                                agregado_id, level_id, level_name, level_type, locality_count
+                            ) VALUES (?, ?, ?, ?, ?)
+                            """,
+                            level_rows,
                         )
-                    )
-                    for categoria in classificacao.get("categorias", []) or []:
-                        category_rows.append(
-                            (
-                                agregado_id,
-                                cid,
-                                categoria.get("id"),
-                                categoria.get("nome"),
-                                categoria.get("unidade"),
-                                categoria.get("nivel"),
-                                _hash_text(
-                                    str(cid),
-                                    str(categoria.get("id")),
-                                    categoria.get("nome", ""),
-                                    categoria.get("unidade", ""),
-                                ),
-                            )
+
+                    if variable_rows:
+                        conn.execute("DELETE FROM variables WHERE agregado_id = ?", (agregado_id,))
+                        conn.executemany(
+                            """
+                            INSERT OR REPLACE INTO variables (
+                                id, agregado_id, nome, unidade, sumarizacao, text_hash
+                            ) VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            variable_rows,
                         )
-                if classification_rows:
-                    conn.executemany(
+
+                    if classification_rows:
+                        conn.execute("DELETE FROM classifications WHERE agregado_id = ?", (agregado_id,))
+                        conn.executemany(
+                            """
+                            INSERT OR REPLACE INTO classifications (
+                                id, agregado_id, nome, sumarizacao_status, sumarizacao_excecao
+                            ) VALUES (?, ?, ?, ?, ?)
+                            """,
+                            classification_rows,
+                        )
+
+                    if category_rows:
+                        conn.execute("DELETE FROM categories WHERE agregado_id = ?", (agregado_id,))
+                        conn.executemany(
+                            """
+                            INSERT OR REPLACE INTO categories (
+                                agregado_id, classification_id, categoria_id, nome, unidade, nivel, text_hash
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            category_rows,
+                        )
+
+                    if period_rows:
+                        conn.execute("DELETE FROM periods WHERE agregado_id = ?", (agregado_id,))
+                        conn.executemany(
+                            """
+                            INSERT OR REPLACE INTO periods (
+                                agregado_id, periodo_id, literals, modificacao
+                            ) VALUES (?, ?, ?, ?)
+                            """,
+                            period_rows,
+                        )
+
+                    if locality_rows:
+                        conn.execute("DELETE FROM localities WHERE agregado_id = ?", (agregado_id,))
+                        conn.executemany(
+                            """
+                            INSERT OR REPLACE INTO localities (
+                                agregado_id, level_id, locality_id, nome
+                            ) VALUES (?, ?, ?, ?)
+                            """,
+                            locality_rows,
+                        )
+
+                    if generate_embeddings and embedding_targets and embedding_client is not None:
+                        await _persist_embeddings(conn, embedding_targets, embedding_client, fetched_at)
+
+                    conn.execute(
                         """
-                        INSERT OR REPLACE INTO classifications (
-                            id, agregado_id, nome, sumarizacao_status, sumarizacao_excecao
-                        ) VALUES (?, ?, ?, ?, ?)
+                        INSERT INTO ingestion_log (agregado_id, stage, status, detail, run_at)
+                        VALUES (?, ?, ?, ?, ?)
                         """,
-                        classification_rows,
-                    )
-                if category_rows:
-                    conn.executemany(
-                        """
-                        INSERT OR REPLACE INTO categories (
-                            agregado_id, classification_id, categoria_id, nome, unidade, nivel, text_hash
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        category_rows,
+                        (agregado_id, "metadata", "success", None, fetched_at),
                     )
 
-                conn.execute("DELETE FROM periods WHERE agregado_id = ?", (agregado_id,))
-                period_rows: list[tuple[int, str, str, Any]] = []
-                for period in periods:
-                    pid = period.get("id") if isinstance(period, dict) else period
-                    literals = period.get("literals", [pid]) if isinstance(period, dict) else [period]
-                    modificacao = period.get("modificacao") if isinstance(period, dict) else None
-                    period_rows.append(
-                        (agregado_id, str(pid), _json_dump_text(literals), modificacao)
-                    )
-                if period_rows:
-                    conn.executemany(
-                        """
-                        INSERT OR REPLACE INTO periods (
-                            agregado_id, periodo_id, literals, modificacao
-                        ) VALUES (?, ?, ?, ?)
-                        """,
-                        period_rows,
-                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
 
-                conn.execute("DELETE FROM localities WHERE agregado_id = ?", (agregado_id,))
-                if locality_rows:
-                    conn.executemany(
-                        """
-                        INSERT OR REPLACE INTO localities (
-                            agregado_id, level_id, locality_id, nome
-                        ) VALUES (?, ?, ?, ?)
-                        """,
-                        locality_rows,
-                    )
-
-                if generate_embeddings and embedding_targets and embedding_client is not None:
-                    await _persist_embeddings(conn, embedding_targets, embedding_client, fetched_at)
-
-                conn.execute(
-                    """
-                    INSERT INTO ingestion_log (agregado_id, stage, status, detail, run_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (agregado_id, "metadata", "success", None, fetched_at),
-                )
-
-                conn.commit()
-
-        if db_lock is not None:
-            async with db_lock:
+        try:
+            if db_lock is not None:
+                async with db_lock:
+                    await _write_to_database()
+            else:
                 await _write_to_database()
-        else:
-            await _write_to_database()
+        except Exception:
+            _log_ingestion_status(agregado_id, "error", "db")
+            raise
 
     finally:
         if own_client:
@@ -493,3 +531,43 @@ def ingest_agregado_sync(agregado_id: int) -> None:
 
 
 __all__ = ["ingest_agregado", "ingest_agregado_sync", "generate_embeddings_for_agregado"]
+class IngestionValidationError(RuntimeError):
+    """Raised when the SIDRA API returns an incomplete metadata payload."""
+
+
+def _validate_metadata_payload(metadata: Any) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        raise IngestionValidationError("metadata payload is not a JSON object")
+
+    nome = metadata.get("nome")
+    if not isinstance(nome, str) or not nome.strip():
+        raise IngestionValidationError("metadata payload missing 'nome'")
+
+    variaveis = metadata.get("variaveis")
+    if variaveis is not None and not isinstance(variaveis, list):
+        raise IngestionValidationError("metadata field 'variaveis' is not a list")
+    classificacoes = metadata.get("classificacoes")
+    if classificacoes is not None and not isinstance(classificacoes, list):
+        raise IngestionValidationError("metadata field 'classificacoes' is not a list")
+    has_variables = isinstance(variaveis, list) and any(variaveis)
+    has_classifications = isinstance(classificacoes, list) and any(classificacoes)
+    if not has_variables and not has_classifications:
+        raise IngestionValidationError("metadata payload missing both 'variaveis' and 'classificacoes'")
+
+    return metadata
+
+
+def _log_ingestion_status(agregado_id: int, status: str, detail: str) -> None:
+    timestamp = _utcnow()
+
+    with sqlite_session() as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO ingestion_log (agregado_id, stage, status, detail, run_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (agregado_id, "metadata", status, detail, timestamp),
+            )
+
+

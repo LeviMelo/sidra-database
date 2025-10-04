@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import json
-from typing import List, Mapping
+from typing import Mapping
 
-from sidra_database.db import create_connection, ensure_schema
-
+from .db import create_connection
 from .schema_migrations import apply_va_schema
 from .search_va import VaResult
-from .synonyms import load_synonyms_into_memory, normalize_basic
+from .synonyms import normalize_basic
 
 
 def _levels(row) -> set[str]:
@@ -89,7 +87,6 @@ def find_neighbors_for_va(
 ) -> list[tuple[VaResult, float]]:
     conn = create_connection()
     try:
-        ensure_schema(conn)
         apply_va_schema(conn)
         cursor = conn.execute(
             """
