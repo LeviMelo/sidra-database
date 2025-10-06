@@ -1,9 +1,10 @@
+# src/sidra_va/schema_migrations.py
 from __future__ import annotations
 
 import sqlite3
 from datetime import datetime
 
-VA_SCHEMA_VERSION = 2
+VA_SCHEMA_VERSION = 3
 
 
 def _ensure_meta_table(connection: sqlite3.Connection) -> None:
@@ -37,12 +38,12 @@ def bump_schema_version(connection: sqlite3.Connection, to_version: int) -> None
 
 def apply_va_schema(connection: sqlite3.Connection) -> None:
     """Apply additive schema objects for the VA subsystem."""
-
     current_version = get_schema_version(connection)
     if current_version >= VA_SCHEMA_VERSION:
         return
 
     with connection:
+        # --- existing objects (unchanged) ---
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS embeddings (
@@ -150,6 +151,72 @@ def apply_va_schema(connection: sqlite3.Connection) -> None:
             CREATE INDEX IF NOT EXISTS idx_value_atoms_period ON value_atoms(period_start, period_end)
             """
         )
+
+        # --- NEW in v3: link index tables (names → tables) ---
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS name_keys (
+              kind TEXT NOT NULL,         -- 'var' | 'class' | 'cat'
+              key  TEXT NOT NULL,         -- normalize_basic(name)
+              raw  TEXT NOT NULL,         -- original string
+              UNIQUE(kind, key, raw)
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS link_var (
+              var_key   TEXT NOT NULL,
+              table_id  INTEGER NOT NULL,
+              variable_id INTEGER NOT NULL,
+              UNIQUE(var_key, table_id, variable_id)
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS link_class (
+              class_key TEXT NOT NULL,
+              table_id  INTEGER NOT NULL,
+              class_id  INTEGER NOT NULL,
+              UNIQUE(class_key, table_id, class_id)
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS link_cat (
+              class_key  TEXT NOT NULL,
+              cat_key    TEXT NOT NULL,
+              table_id   INTEGER NOT NULL,
+              class_id   INTEGER NOT NULL,
+              category_id INTEGER NOT NULL,
+              UNIQUE(class_key, cat_key, table_id, class_id, category_id)
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS link_var_class (
+              var_key    TEXT NOT NULL,
+              class_key  TEXT NOT NULL,
+              table_id   INTEGER NOT NULL,
+              variable_id INTEGER NOT NULL,
+              class_id    INTEGER NOT NULL,
+              UNIQUE(var_key, class_key, table_id, variable_id, class_id)
+            )
+            """
+        )
+
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_link_var_key   ON link_var(var_key)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_link_class_key ON link_class(class_key)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_link_cat_keys  ON link_cat(class_key, cat_key)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_link_var_class ON link_var_class(var_key, class_key)")
 
         bump_schema_version(connection, VA_SCHEMA_VERSION)
 

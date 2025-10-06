@@ -21,6 +21,8 @@ from .base_schema import apply_base_schema
 from .search_va import VaResult, VaSearchFilters, search_value_atoms
 from .synonyms import export_synonyms_csv, import_synonyms_csv
 from .value_index import build_va_index_for_agregado, build_va_index_for_all
+from .links import build_links_for_agregado, build_links_for_all
+from .search_tables import SearchArgs, search_tables
 
 
 def _ensure_va_schema() -> None:
@@ -709,6 +711,27 @@ def build_parser() -> argparse.ArgumentParser:
     index_sub = index_parser.add_subparsers(dest="index_command")
 
     build_va = index_sub.add_parser("build-va")
+    build_links = index_sub.add_parser("build-links", help="Build name→table link indexes")
+    build_links.add_argument("--ids", nargs="*", type=int)
+    build_links.add_argument("--all", action="store_true")
+    build_links.add_argument("--concurrent", type=int, default=4)
+    def _cmd_build_links(args: argparse.Namespace) -> None:
+        _ensure_va_schema()
+        if args.all:
+            stats = asyncio.run(build_links_for_all(concurrency=args.concurrent))
+            if not stats:
+                print("No tables with variables.")
+                return
+            for tid, c in sorted(stats.items()):
+                print(f"{tid}: vars={c.vars}, classes={c.classes}, cats={c.cats}, var×class={c.var_class}")
+            return
+        if not args.ids:
+            raise SystemExit("Provide --ids or --all")
+        for tid in args.ids:
+            c = build_links_for_agregado(int(tid))
+            print(f"{tid}: vars={c.vars}, classes={c.classes}, cats={c.cats}, var×class={c.var_class}")
+    build_links.set_defaults(func=_cmd_build_links)
+
     build_va.add_argument("--ids", nargs="*", type=int)
     build_va.add_argument("--all", action="store_true")
     build_va.add_argument("--allow-two-dim-combos", action="store_true")
@@ -750,6 +773,70 @@ def build_parser() -> argparse.ArgumentParser:
     search_va.add_argument("--semantic", action="store_true")
     search_va.add_argument("--json", action="store_true")
     search_va.set_defaults(func=cmd_search_va)
+
+    search_tables_cmd = search_sub.add_parser("tables", help="Search tables by var/class/title/coverage")
+    search_tables_cmd.add_argument("--q", dest="q", default=None, help="free-text title query (optional)")
+    search_tables_cmd.add_argument("--var", dest="vars", action="append", help="variable name (repeatable)")
+    search_tables_cmd.add_argument("--class", dest="classes", action="append", help='class name or "Class:Category" (repeatable)')
+    search_tables_cmd.add_argument("--coverage", dest="coverage", default=None, help="boolean coverage expr, e.g. '(N6>=5000)'")
+    search_tables_cmd.add_argument("--limit", type=int, default=20)
+    search_tables_cmd.add_argument("--no-fuzzy", dest="allow_fuzzy", action="store_false")
+    search_tables_cmd.set_defaults(allow_fuzzy=True)
+    search_tables_cmd.add_argument("--var-th", type=float, default=0.90)
+    search_tables_cmd.add_argument("--class-th", type=float, default=0.85)
+    search_tables_cmd.add_argument("--semantic", action="store_true", help="use semantic ranking for titles (requires embeddings)")
+    search_tables_cmd.add_argument("--json", action="store_true")
+
+    def _cmd_search_tables(args: argparse.Namespace) -> None:
+        _ensure_va_schema()
+        sargs = SearchArgs(
+            q=args.q,
+            vars=tuple(args.vars or ()),
+            classes=tuple(args.classes or ()),
+            coverage=args.coverage,
+            limit=max(1, args.limit),
+            allow_fuzzy=bool(args.allow_fuzzy),
+            var_th=float(args.var_th),
+            class_th=float(args.class_th),
+            semantic=bool(args.semantic),
+        )
+        emb = EmbeddingClient() if args.semantic else None
+        hits = asyncio.run(search_tables(sargs, embedding_client=emb))
+        if args.json:
+            import json
+            print(json.dumps([
+                {
+                    "id": h.table_id,
+                    "title": h.title,
+                    "period_start": h.period_start,
+                    "period_end": h.period_end,
+                    "n3": h.n3,
+                    "n6": h.n6,
+                    "why": h.why,
+                    "score": h.score,
+                    "rrf_score": h.rrf_score,
+                    "struct_score": h.struct_score,
+                }
+                for h in hits
+            ], indent=2, ensure_ascii=False))
+            return
+        if not hits:
+            print("No results.")
+            return
+        for h in hits:
+            period = ""
+            if h.period_start or h.period_end:
+                if h.period_start and h.period_end and h.period_start != h.period_end:
+                    period = f" | {h.period_start}–{h.period_end}"
+                else:
+                    period = f" | {h.period_start or h.period_end}"
+            cov = f" | N3={h.n3} N6={h.n6}" if (h.n3 or h.n6) else ""
+            print(f"{h.table_id}: {h.title}{period}{cov}")
+            if h.why:
+                print("  matches:", " ".join(f"[{w}]" for w in h.why))
+            print(f"  score={h.score:.3f} (struct={h.struct_score:.3f}, rrf={h.rrf_score:.3f})")
+
+    search_tables_cmd.set_defaults(func=_cmd_search_tables)
 
     show_parser = subparsers.add_parser("show")
     show_sub = show_parser.add_subparsers(dest="show_command")
