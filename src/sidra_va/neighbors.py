@@ -104,7 +104,8 @@ def find_neighbors_for_va(
                    var.nome AS variable_name, var.unidade AS variable_unit
             FROM value_atoms AS va
             JOIN agregados AS ag ON ag.id = va.agregado_id
-            JOIN variables AS var ON var.id = va.variable_id
+            JOIN variables AS var
+                ON var.id = va.variable_id AND var.agregado_id = va.agregado_id
             LEFT JOIN variable_fingerprints AS vf ON vf.variable_id = va.variable_id
             WHERE va.va_id = ?
             """,

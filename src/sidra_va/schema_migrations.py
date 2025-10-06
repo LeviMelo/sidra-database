@@ -125,8 +125,10 @@ def apply_va_schema(connection: sqlite3.Connection) -> None:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS variable_fingerprints (
-              variable_id INTEGER PRIMARY KEY,
-              fingerprint TEXT NOT NULL
+                agregado_id INTEGER NOT NULL,
+                variable_id INTEGER NOT NULL,
+                fingerprint TEXT NOT NULL,
+                PRIMARY KEY (agregado_id, variable_id)
             )
             """
         )

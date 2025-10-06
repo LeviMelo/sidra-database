@@ -418,6 +418,7 @@ async def ingest_agregado(
             with sqlite_session() as conn:
                 conn.execute("BEGIN")
                 try:
+                    # 0) Upsert agregados header row first (no children depend on it)
                     conn.execute(
                         """
                         INSERT OR REPLACE INTO agregados (
@@ -441,8 +442,25 @@ async def ingest_agregado(
                         ),
                     )
 
+                    # 1) DELETE children first (FK-safe), then parents
+                    #    localities -> agregados_levels
+                    conn.execute("DELETE FROM localities WHERE agregado_id = ?", (agregado_id,))
+                    conn.execute("DELETE FROM agregados_levels WHERE agregado_id = ?", (agregado_id,))
+
+                    #    categories -> classifications
+                    conn.execute("DELETE FROM categories WHERE agregado_id = ?", (agregado_id,))
+                    conn.execute("DELETE FROM classifications WHERE agregado_id = ?", (agregado_id,))
+
+                    #    variables have no children we manage here, but purge before reinsert
+                    conn.execute("DELETE FROM variables WHERE agregado_id = ?", (agregado_id,))
+
+                    #    periods: only child of agregados (we keep agregados), so purge them safely
+                    conn.execute("DELETE FROM periods WHERE agregado_id = ?", (agregado_id,))
+
+                    # 2) INSERT parents first, then children
+
+                    # agregados_levels (parent of localities)
                     if level_rows:
-                        conn.execute("DELETE FROM agregados_levels WHERE agregado_id = ?", (agregado_id,))
                         conn.executemany(
                             """
                             INSERT OR REPLACE INTO agregados_levels (
@@ -452,8 +470,8 @@ async def ingest_agregado(
                             level_rows,
                         )
 
+                    # variables (standalone; used by VA index later)
                     if variable_rows:
-                        conn.execute("DELETE FROM variables WHERE agregado_id = ?", (agregado_id,))
                         conn.executemany(
                             """
                             INSERT OR REPLACE INTO variables (
@@ -463,8 +481,8 @@ async def ingest_agregado(
                             variable_rows,
                         )
 
+                    # classifications (parent of categories)
                     if classification_rows:
-                        conn.execute("DELETE FROM classifications WHERE agregado_id = ?", (agregado_id,))
                         conn.executemany(
                             """
                             INSERT OR REPLACE INTO classifications (
@@ -474,8 +492,8 @@ async def ingest_agregado(
                             classification_rows,
                         )
 
+                    # categories (child of classifications)
                     if category_rows:
-                        conn.execute("DELETE FROM categories WHERE agregado_id = ?", (agregado_id,))
                         conn.executemany(
                             """
                             INSERT OR REPLACE INTO categories (
@@ -485,19 +503,40 @@ async def ingest_agregado(
                             category_rows,
                         )
 
+                    # periods (standalone child of agregados)
                     if period_rows:
-                        conn.execute("DELETE FROM periods WHERE agregado_id = ?", (agregado_id,))
+                        def _iter_period_rows():
+                            for row in period_rows:
+                                # Accept [ag, pid, literals_json, modificacao, ord, kind]  (new)
+                                # or    [ag, pid, literals_json, modificacao]             (old)
+                                if len(row) >= 6:
+                                    ag, pid, literals_json, modificacao, ord_val, kind = row[:6]
+                                    # backfill if someone built with None ord/kind
+                                    if ord_val is None or kind is None:
+                                        ord_val, kind = _normalize_period_id_to_ord_kind(pid)
+                                elif len(row) == 4:
+                                    ag, pid, literals_json, modificacao = row
+                                    ord_val, kind = _normalize_period_id_to_ord_kind(pid)
+                                else:
+                                    # very defensive fallback
+                                    ag = row[0]
+                                    pid = row[1]
+                                    literals_json = row[2] if len(row) > 2 else "[]"
+                                    modificacao = row[3] if len(row) > 3 else None
+                                    ord_val, kind = _normalize_period_id_to_ord_kind(pid)
+                                yield (ag, pid, literals_json, modificacao, ord_val, kind)
+
                         conn.executemany(
                             """
                             INSERT OR REPLACE INTO periods (
                                 agregado_id, periodo_id, literals, modificacao, periodo_ord, periodo_kind
                             ) VALUES (?, ?, ?, ?, ?, ?)
                             """,
-                            period_rows,
+                            list(_iter_period_rows()),
                         )
 
+                    # localities (child of agregados_levels)
                     if locality_rows:
-                        conn.execute("DELETE FROM localities WHERE agregado_id = ?", (agregado_id,))
                         conn.executemany(
                             """
                             INSERT OR REPLACE INTO localities (
@@ -507,9 +546,11 @@ async def ingest_agregado(
                             locality_rows,
                         )
 
+                    # 3) (optional) embeddings for table header
                     if generate_embeddings and embedding_targets and embedding_client is not None:
                         await _persist_embeddings(conn, embedding_targets, embedding_client, fetched_at)
 
+                    # 4) log success
                     conn.execute(
                         """
                         INSERT INTO ingestion_log (agregado_id, stage, status, detail, run_at)

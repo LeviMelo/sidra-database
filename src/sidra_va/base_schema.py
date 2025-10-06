@@ -31,12 +31,13 @@ TABLE_STATEMENTS: tuple[str, ...] = (
     """,
     """
     CREATE TABLE IF NOT EXISTS variables (
-        id INTEGER PRIMARY KEY,
+        id          INTEGER NOT NULL,
         agregado_id INTEGER NOT NULL,
-        nome TEXT NOT NULL,
-        unidade TEXT,
+        nome        TEXT NOT NULL,
+        unidade     TEXT,
         sumarizacao TEXT,
-        text_hash TEXT NOT NULL,
+        text_hash   TEXT NOT NULL,
+        PRIMARY KEY (agregado_id, id),
         FOREIGN KEY (agregado_id) REFERENCES agregados(id)
     )
     """,
@@ -124,11 +125,15 @@ ADDITIONAL_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("agregados", "municipality_locality_count", "INTEGER DEFAULT 0"),
     ("agregados", "covers_national_municipalities", "INTEGER DEFAULT 0"),
     ("agregados_levels", "locality_count", "INTEGER DEFAULT 0"),
-    # NEW — add both:
+    # NEW: periods ordering/typed kind
     ("periods", "periodo_ord", "INTEGER"),
     ("periods", "periodo_kind", "TEXT"),
 )
 
+EXTRA_INDEXES: tuple[str, ...] = (
+    # requires periodo_ord to exist
+    "CREATE INDEX IF NOT EXISTS idx_periods_ord ON periods(agregado_id, periodo_ord)",
+)
 
 def _column_exists(connection, table: str, column: str) -> bool:
     cursor = connection.execute(f"PRAGMA table_info({table})")
@@ -147,7 +152,11 @@ def apply_base_schema(connection) -> None:
     for table, column, definition in ADDITIONAL_COLUMNS:
         if not _column_exists(connection, table, column):
             cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
+            
+    # create extra indexes after ensuring columns exist
+    for stmt in EXTRA_INDEXES:
+        cursor.execute(stmt)
+        
     # 3) Indexes (safe now that columns exist)
     for stmt in INDEX_STATEMENTS:
         cursor.execute(stmt)

@@ -3,15 +3,15 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .db import create_connection
 from .schema_migrations import apply_va_schema
 from .synonyms import normalize_basic
 from .coverage import parse_coverage_expr, extract_levels, eval_coverage
-from .scoring import rrf
+from .scoring import rrf, DEFAULT_WEIGHTS
 from .embedding_client import EmbeddingClient
-from typing import NamedTuple
+
 
 @dataclass(frozen=True)
 class TableHit:
@@ -25,15 +25,13 @@ class TableHit:
     score: float
     rrf_score: float
     struct_score: float
-    agregado_id: str
-    score: float
 
 
 @dataclass(frozen=True)
 class SearchArgs:
     q: str | None
     vars: Tuple[str, ...]
-    classes: Tuple[str, ...]   # can be "Class" or "Class:Category"
+    classes: Tuple[str, ...]   # "Class" or "Class:Category"
     coverage: str | None
     limit: int
     allow_fuzzy: bool
@@ -51,7 +49,6 @@ def _split_class_spec(spec: str) -> Tuple[str, Optional[str]]:
 
 
 def _fts_tokens(text: str) -> List[str]:
-    # reuse normalize_basic to make simple tokens
     return [t for t in normalize_basic(text).split() if t]
 
 
@@ -65,9 +62,12 @@ def _tables_for_var_keys(conn, keys: Iterable[str]) -> Set[int]:
         return set()
     tables: Set[int] = set()
     for key in keys:
-        rows = conn.execute("SELECT DISTINCT table_id FROM link_var WHERE var_key = ?", (key,)).fetchall()
+        rows = conn.execute(
+            "SELECT DISTINCT table_id FROM link_var WHERE var_key = ?",
+            (key,),
+        ).fetchall()
         ids = {int(r[0]) for r in rows}
-        tables = ids if not tables else tables & ids  # intersect across multiple var entries
+        tables = ids if not tables else tables & ids  # intersect across multiple vars
     return tables
 
 
@@ -76,7 +76,10 @@ def _tables_for_class_keys(conn, keys: Iterable[str]) -> Set[int]:
         return set()
     tables: Set[int] = set()
     for key in keys:
-        rows = conn.execute("SELECT DISTINCT table_id FROM link_class WHERE class_key = ?", (key,)).fetchall()
+        rows = conn.execute(
+            "SELECT DISTINCT table_id FROM link_class WHERE class_key = ?",
+            (key,),
+        ).fetchall()
         ids = {int(r[0]) for r in rows}
         tables = ids if not tables else tables & ids
     return tables
@@ -97,7 +100,7 @@ def _tables_for_class_cat(conn, pairs: Iterable[Tuple[str, str]]) -> Set[int]:
 
 
 def _enforce_var_class(conn, table_ids: Set[int], var_keys: Set[str], class_keys: Set[str]) -> Set[int]:
-    """Ensure each table has the var+class pair(s) (link_var_class)."""
+    """Keep only tables that have every (var_key, class_key) pair in link_var_class."""
     if not table_ids or not var_keys or not class_keys:
         return table_ids
     keep: Set[int] = set()
@@ -137,9 +140,13 @@ async def search_tables(
         class_specs_raw = [s for s in args.classes if s and s.strip()]
         class_pairs_strict: List[Tuple[str, Optional[str]]] = [_split_class_spec(s) for s in class_specs_raw]
         class_keys_strict = {normalize_basic(a) for (a, b) in class_pairs_strict if normalize_basic(a)}
-        class_cat_pairs_strict = [(normalize_basic(a), normalize_basic(b)) for (a, b) in class_pairs_strict if b and normalize_basic(a) and normalize_basic(b)]
+        class_cat_pairs_strict = [
+            (normalize_basic(a), normalize_basic(b))
+            for (a, b) in class_pairs_strict
+            if b and normalize_basic(a) and normalize_basic(b)
+        ]
 
-        # ---- candidate tables (strict)
+        # ---- candidate tables (strict first)
         candidates: Optional[Set[int]] = None
 
         if var_keys_strict:
@@ -154,17 +161,16 @@ async def search_tables(
             ids = _tables_for_class_cat(conn, class_cat_pairs_strict)
             candidates = ids if candidates is None else candidates & ids
 
-        # enforce var+class co-occurrence inside each table
+        # enforce var+class co-occurrence
         if candidates and var_keys_strict and class_keys_strict:
             candidates = _enforce_var_class(conn, candidates, var_keys_strict, class_keys_strict)
 
-        # ---- fuzzy expansion (if allowed)
+        # ---- fuzzy expansion (optional)
         fuzzy_used_vars: Set[str] = set()
         fuzzy_used_classes: Set[str] = set()
         if args.allow_fuzzy:
             from .fuzzy import similar_keys  # lazy import
 
-            # expand vars
             if var_keys_strict:
                 expanded_v = set(var_keys_strict)
                 for v in args.vars:
@@ -176,9 +182,8 @@ async def search_tables(
                 if expanded_v != var_keys_strict:
                     ids = _tables_for_var_keys(conn, sorted(expanded_v))
                     candidates = ids if candidates is None else candidates & ids
-                    var_keys_strict = expanded_v  # reuse downstream
+                    var_keys_strict = expanded_v
 
-            # expand classes (name-only; categories remain strict)
             if class_keys_strict:
                 expanded_c = set(class_keys_strict)
                 for c_raw, _cat in class_pairs_strict:
@@ -191,16 +196,19 @@ async def search_tables(
                     ids = _tables_for_class_keys(conn, sorted(expanded_c))
                     candidates = ids if candidates is None else candidates & ids
                     class_keys_strict = expanded_c
-                # re-enforce var+class with expanded class keys
+                # re-enforce with expanded class keys
                 if candidates and var_keys_strict and class_keys_strict:
                     candidates = _enforce_var_class(conn, candidates, var_keys_strict, class_keys_strict)
 
-        # If nothing constrained by var/class, fall back to "all tables" (to let title ranking + coverage run)
+        # no structural constraints → start from all tables (title/coverage can still filter)
         if candidates is None:
             rows = conn.execute("SELECT id FROM agregados").fetchall()
             candidates = {int(r[0]) for r in rows}
 
-        # ---- coverage filter
+        if not candidates:
+            return []
+
+        # ---- coverage filter (boolean expr on agregados_levels)
         if args.coverage:
             try:
                 ast = parse_coverage_expr(args.coverage)
@@ -218,11 +226,10 @@ async def search_tables(
                     if eval_coverage(ast, counts):
                         keep.add(tid)
                 candidates = keep
+                if not candidates:
+                    return []
 
-        if not candidates:
-            return []
-
-        # ---- title ranking (lexical + optional semantic)
+        # ---- title ranking (lexical FTS + optional semantic)
         lexical_ranks: Dict[int, int] = {}
         semantic_ranks: Dict[int, int] = {}
 
@@ -231,7 +238,7 @@ async def search_tables(
             if fts:
                 rows = conn.execute(
                     """
-                    SELECT va.agregado_id
+                    SELECT DISTINCT va.agregado_id
                     FROM value_atoms_fts AS f
                     JOIN value_atoms AS va ON va.va_id = f.va_id
                     WHERE f.value_atoms_fts MATCH ?
@@ -250,8 +257,8 @@ async def search_tables(
                 lexical_ranks = {tid: idx + 1 for idx, tid in enumerate(order)}
 
         if args.q and args.semantic and embedding_client is not None:
+            # cosine to table-level embeddings (entity_type='agregado')
             qvec = await asyncio.to_thread(embedding_client.embed_text, args.q, embedding_client.model)
-            # Only embed candidates
             ordered = sorted(candidates)
             placeholders = ",".join("?" for _ in ordered)
             sql = (
@@ -262,16 +269,16 @@ async def search_tables(
                 """
             )
             cur = conn.execute(sql, (embedding_client.model, *ordered))
-            # turn blob to vector
+
             from array import array
+            import math
+
             def to_vec(blob, dim):
                 arr = array("f")
                 arr.frombytes(blob)
                 vs = list(arr)
                 return vs[:dim] if dim and len(vs) > dim else vs
 
-            sims: List[Tuple[int, float]] = []
-            import math
             def cosine(a: Sequence[float], b: Sequence[float]) -> float:
                 if not a or not b or len(a) != len(b):
                     return 0.0
@@ -282,6 +289,7 @@ async def search_tables(
                     return 0.0
                 return dot / (na * nb)
 
+            sims: List[Tuple[int, float]] = []
             for row in cur.fetchall():
                 tid = int(row["entity_id"])
                 vec = to_vec(row["vector"], int(row["dimension"]))
@@ -294,7 +302,7 @@ async def search_tables(
 
         rrf_scores = rrf({**lexical_ranks, **semantic_ranks}, k=60.0)
 
-        # ---- structure score: how many strict matches (var/class) this table satisfied
+        # ---- structure score (+ why markers)
         def struct_score_for(tid: int) -> Tuple[float, List[str]]:
             why: List[str] = []
             score = 0.0
@@ -306,7 +314,6 @@ async def search_tables(
                     (tid, vk),
                 ).fetchone()
                 if row:
-                    # fuzzy?
                     if vk in fuzzy_used_vars:
                         score += 0.5
                         why.append(f'var≈"{vk}"')
@@ -328,7 +335,7 @@ async def search_tables(
                         score += 1.0
                         why.append(f'class="{ck}"')
 
-            # category pins (strict only)
+            # pinned categories (strict)
             for (ck, catk) in class_cat_pairs_strict:
                 row = conn.execute(
                     "SELECT 1 FROM link_cat WHERE table_id = ? AND class_key = ? AND cat_key = ? LIMIT 1",
@@ -338,13 +345,17 @@ async def search_tables(
                     score += 0.5
                     why.append(f'{ck}:"{catk}"')
 
-            # var+class co-occurrence bonus
+            # var×class co-occurrence bonus (only if both provided)
             if var_keys_strict and class_keys_strict:
                 ok_all = True
                 for vk in var_keys_strict:
                     for ck in class_keys_strict:
                         row = conn.execute(
-                            "SELECT 1 FROM link_var_class WHERE table_id = ? AND var_key = ? AND class_key = ? LIMIT 1",
+                            """
+                            SELECT 1 FROM link_var_class
+                            WHERE table_id = ? AND var_key = ? AND class_key = ?
+                            LIMIT 1
+                            """,
                             (tid, vk, ck),
                         ).fetchone()
                         if not row:
@@ -358,7 +369,6 @@ async def search_tables(
 
             return score, why
 
-        # collect metadata + scores
         hits: List[TableHit] = []
         for tid in candidates:
             row = conn.execute(
@@ -367,38 +377,42 @@ async def search_tables(
             ).fetchone()
             if not row:
                 continue
-            # coverage short summary
-            n3 = conn.execute(
+
+            # coverage quick counts for display
+            n3r = conn.execute(
                 "SELECT COALESCE(locality_count,0) FROM agregados_levels WHERE agregado_id=? AND level_id='N3'",
                 (tid,),
             ).fetchone()
-            n6 = conn.execute(
+            n6r = conn.execute(
                 "SELECT COALESCE(locality_count,0) FROM agregados_levels WHERE agregado_id=? AND level_id='N6'",
                 (tid,),
             ).fetchone()
-            n3c = int(n3[0]) if n3 else 0
-            n6c = int(n6[0]) if n6 else 0
+            n3 = int(n3r[0]) if n3r else 0
+            n6 = int(n6r[0]) if n6r else 0
 
             struct, why = struct_score_for(tid)
-            rrf_s = rrf_scores.get(tid, 0.0)
-            final = 0.7 * struct + 0.3 * rrf_s
+            rrf_score = float(rrf_scores.get(tid, 0.0))
+
+            w = DEFAULT_WEIGHTS
+            final = w["struct"] * struct + w["rrf"] * rrf_score
 
             hits.append(
                 TableHit(
                     table_id=int(row["id"]),
-                    title=row["nome"] or "",
+                    title=str(row["nome"] or ""),
                     period_start=row["periodo_inicio"],
                     period_end=row["periodo_fim"],
-                    n3=n3c,
-                    n6=n6c,
+                    n3=n3,
+                    n6=n6,
                     why=why,
                     score=final,
-                    rrf_score=rrf_s,
+                    rrf_score=rrf_score,
                     struct_score=struct,
                 )
             )
 
+        # sort + cap
         hits.sort(key=lambda h: h.score, reverse=True)
-        return hits[: args.limit]
+        return hits[: max(1, int(args.limit))]
     finally:
         conn.close()
