@@ -138,7 +138,7 @@ def _canonical_category_text(
         lines.append(f"Level: {level}")
     return "\n".join(line for line in lines if line)
 
-def _normalize_period_id_to_ord_kind(periodo_id: Any) -> Tuple[int | None, str]:
+def _normalize_period_id_to_ord_kind(periodo_id: Any) -> tuple[int | None, str]:
     """
     Map raw period id to a sortable ordinal and a kind:
       YYYY    -> ord=YYYY00, kind='Y'
@@ -160,7 +160,7 @@ def _normalize_period_id_to_ord_kind(periodo_id: Any) -> Tuple[int | None, str]:
             return int(digits), "YM"
         except ValueError:
             return None, "UNK"
-    if len(digits) == 8:   # YYYYMMDD (rare, but safe)
+    if len(digits) == 8:   # YYYYMMDD
         try:
             return int(digits), "YMD"
         except ValueError:

@@ -1,7 +1,7 @@
 """SQLite schema creation helpers for base SIDRA tables."""
 from __future__ import annotations
 
-SCHEMA_STATEMENTS: tuple[str, ...] = (
+TABLE_STATEMENTS: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS agregados (
         id INTEGER PRIMARY KEY,
@@ -70,7 +70,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         periodo_id TEXT NOT NULL,
         literals TEXT NOT NULL,
         modificacao TEXT,
-        -- New: normalized/typed period for precise filtering
+        -- normalized/typed period for precise filtering
         periodo_ord INTEGER,          -- sortable ordinal (YYYY00/ YYYYMM / YYYYMMDD)
         periodo_kind TEXT,            -- 'Y' | 'YM' | 'YMD' | 'UNK'
         PRIMARY KEY (agregado_id, periodo_id),
@@ -97,6 +97,9 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         run_at TEXT NOT NULL
     )
     """,
+)
+
+INDEX_STATEMENTS: tuple[str, ...] = (
     """
     CREATE INDEX IF NOT EXISTS idx_variables_agregado ON variables(agregado_id)
     """,
@@ -110,6 +113,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE UNIQUE INDEX IF NOT EXISTS u_agregados_levels_pair
     ON agregados_levels(agregado_id, level_id)
     """,
+    # new — now safe because columns exist:
     """
     CREATE INDEX IF NOT EXISTS idx_periods_agregado_ord
     ON periods(agregado_id, periodo_ord)
@@ -134,12 +138,22 @@ def _column_exists(connection, table: str, column: str) -> bool:
 def apply_base_schema(connection) -> None:
     """Execute schema statements on the provided SQLite connection."""
     cursor = connection.cursor()
-    for stmt in SCHEMA_STATEMENTS:
+
+    # 1) Tables
+    for stmt in TABLE_STATEMENTS:
         cursor.execute(stmt)
+
+    # 2) Additive columns (for already-existing DBs)
     for table, column, definition in ADDITIONAL_COLUMNS:
         if not _column_exists(connection, table, column):
             cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    # 3) Indexes (safe now that columns exist)
+    for stmt in INDEX_STATEMENTS:
+        cursor.execute(stmt)
+
     connection.commit()
+
 
 
 __all__ = ["apply_base_schema"]

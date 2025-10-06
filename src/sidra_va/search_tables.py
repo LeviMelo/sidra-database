@@ -11,7 +11,7 @@ from .synonyms import normalize_basic
 from .coverage import parse_coverage_expr, extract_levels, eval_coverage
 from .scoring import rrf
 from .embedding_client import EmbeddingClient
-
+from typing import NamedTuple
 
 @dataclass(frozen=True)
 class TableHit:
@@ -25,6 +25,8 @@ class TableHit:
     score: float
     rrf_score: float
     struct_score: float
+    agregado_id: str
+    score: float
 
 
 @dataclass(frozen=True)
