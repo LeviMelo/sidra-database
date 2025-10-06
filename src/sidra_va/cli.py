@@ -445,13 +445,53 @@ def _print_results(results: list[VaResult], json_output: bool) -> None:
 
 
 def _parse_period(period: str | None) -> tuple[int | None, int | None]:
+    """
+    Accepts:
+      'YYYY' or 'YYYY-YYYY' (or with '–')
+      'YYYYMM' or 'YYYYMM-YYYYMM' (or with '–')
+    Returns (ord_start, ord_end) where:
+      YYYY   -> [YYYY00, YYYY99]
+      YYYYMM -> [YYYYMM, YYYYMM]
+    """
     if not period:
         return None, None
-    if "-" in period:
-        start, end = period.split("-", 1)
-        return int(start), int(end)
-    year = int(period)
-    return year, year
+
+    def _one_to_ord(s: str) -> tuple[int, str]:
+        ds = "".join(ch for ch in s if ch.isdigit())
+        if len(ds) == 4:
+            return int(ds + "00"), "Y"
+        if len(ds) == 6:
+            return int(ds), "YM"
+        if len(ds) == 8:
+            return int(ds), "YMD"
+        raise ValueError(f"Unsupported period token: {s!r}")
+
+    # allow hyphen or en dash
+    sep = "–" if "–" in period else "-"
+    if sep in period:
+        a, b = [p.strip() for p in period.split(sep, 1)]
+        ao, ak = _one_to_ord(a)
+        bo, bk = _one_to_ord(b)
+        # Expand year ranges to cover all months of that year
+        def _expand_end(ord_val: int, kind: str) -> int:
+            if kind == "Y":
+                # YYYY00..YYYY99
+                yyyy = ord_val // 100
+                return int(f"{yyyy}99")
+            return ord_val
+        ao2 = ao if ak != "Y" else ao
+        bo2 = _expand_end(bo, bk)
+        if ao2 > bo2:
+            ao2, bo2 = bo2, ao2
+        return ao2, bo2
+
+    # single token
+    o, k = _one_to_ord(period.strip())
+    if k == "Y":
+        yyyy = o // 100
+        return o, int(f"{yyyy}99")
+    return o, o
+
 
 
 def cmd_search_va(args: argparse.Namespace) -> None:

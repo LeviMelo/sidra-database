@@ -85,24 +85,38 @@ def _structural_candidate_ids(conn, filters: VaSearchFilters) -> set[str] | None
             relevant = True
             conditions.append(f"va.{column} = 1")
 
-    if filters.period_start is not None:
+    # Precise period filter via periods.periodo_ord
+    if filters.period_start is not None or filters.period_end is not None:
         relevant = True
-        conditions.append(
-            "CAST(COALESCE(NULLIF(va.period_end, ''), NULLIF(va.period_start, ''), '0') AS INTEGER) >= ?"
-        )
-        params.append(filters.period_start)
-
-    if filters.period_end is not None:
-        relevant = True
-        conditions.append(
-            "CAST(COALESCE(NULLIF(va.period_start, ''), NULLIF(va.period_end, ''), '0') AS INTEGER) <= ?"
-        )
-        params.append(filters.period_end)
+        if filters.period_start is not None and filters.period_end is not None:
+            conditions.append(
+                "EXISTS (SELECT 1 FROM periods p "
+                "        WHERE p.agregado_id = va.agregado_id "
+                "          AND p.periodo_ord IS NOT NULL "
+                "          AND p.periodo_ord BETWEEN ? AND ?)"
+            )
+            params.extend([int(filters.period_start), int(filters.period_end)])
+        elif filters.period_start is not None:
+            conditions.append(
+                "EXISTS (SELECT 1 FROM periods p "
+                "        WHERE p.agregado_id = va.agregado_id "
+                "          AND p.periodo_ord IS NOT NULL "
+                "          AND p.periodo_ord >= ?)"
+            )
+            params.append(int(filters.period_start))
+        else:  # only period_end
+            conditions.append(
+                "EXISTS (SELECT 1 FROM periods p "
+                "        WHERE p.agregado_id = va.agregado_id "
+                "          AND p.periodo_ord IS NOT NULL "
+                "          AND p.periodo_ord <= ?)"
+            )
+            params.append(int(filters.period_end))
 
     if filters.min_municipalities is not None:
         relevant = True
         conditions.append("COALESCE(ag.municipality_locality_count, 0) >= ?")
-        params.append(filters.min_municipalities)
+        params.append(int(filters.min_municipalities))
 
     if filters.requires_national_munis:
         relevant = True

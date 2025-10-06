@@ -138,6 +138,35 @@ def _canonical_category_text(
         lines.append(f"Level: {level}")
     return "\n".join(line for line in lines if line)
 
+def _normalize_period_id_to_ord_kind(periodo_id: Any) -> Tuple[int | None, str]:
+    """
+    Map raw period id to a sortable ordinal and a kind:
+      YYYY    -> ord=YYYY00, kind='Y'
+      YYYYMM  -> ord=YYYYMM, kind='YM'
+      YYYYMMDD-> ord=YYYYMMDD, kind='YMD'
+      otherwise -> (None, 'UNK')
+    We only strip digits; we don't guess beyond obvious lengths.
+    """
+    s = str(periodo_id or "").strip()
+    digits = "".join(ch for ch in s if ch.isdigit())
+
+    if len(digits) == 4:   # YYYY
+        try:
+            return int(digits + "00"), "Y"
+        except ValueError:
+            return None, "UNK"
+    if len(digits) == 6:   # YYYYMM
+        try:
+            return int(digits), "YM"
+        except ValueError:
+            return None, "UNK"
+    if len(digits) == 8:   # YYYYMMDD (rare, but safe)
+        try:
+            return int(digits), "YMD"
+        except ValueError:
+            return None, "UNK"
+
+    return None, "UNK"
 
 def _build_embedding_targets(agregado_id: int, metadata: dict[str, Any]) -> list[_EmbeddingTarget]:
     table_text = _canonical_agregado_text(metadata)
@@ -369,12 +398,15 @@ async def ingest_agregado(
                     )
                 )
 
-        period_rows: list[tuple[int, str, str, Any]] = []
+        period_rows: list[tuple[int, str, str, Any, int | None, str]] = []
         for period in periods or []:
             pid = period.get("id") if isinstance(period, dict) else period
             literals = period.get("literals", [pid]) if isinstance(period, dict) else [period]
             modificacao = period.get("modificacao") if isinstance(period, dict) else None
-            period_rows.append((agregado_id, str(pid), _json_dump_text(literals), modificacao))
+            ord_val, kind = _normalize_period_id_to_ord_kind(pid)
+            period_rows.append(
+                (agregado_id, str(pid), _json_dump_text(literals), modificacao, ord_val, kind)
+            )
 
         embedding_targets: list[_EmbeddingTarget] = []
         if generate_embeddings:
@@ -458,8 +490,8 @@ async def ingest_agregado(
                         conn.executemany(
                             """
                             INSERT OR REPLACE INTO periods (
-                                agregado_id, periodo_id, literals, modificacao
-                            ) VALUES (?, ?, ?, ?)
+                                agregado_id, periodo_id, literals, modificacao, periodo_ord, periodo_kind
+                            ) VALUES (?, ?, ?, ?, ?, ?)
                             """,
                             period_rows,
                         )

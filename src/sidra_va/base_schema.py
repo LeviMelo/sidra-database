@@ -70,6 +70,9 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         periodo_id TEXT NOT NULL,
         literals TEXT NOT NULL,
         modificacao TEXT,
+        -- New: normalized/typed period for precise filtering
+        periodo_ord INTEGER,          -- sortable ordinal (YYYY00/ YYYYMM / YYYYMMDD)
+        periodo_kind TEXT,            -- 'Y' | 'YM' | 'YMD' | 'UNK'
         PRIMARY KEY (agregado_id, periodo_id),
         FOREIGN KEY (agregado_id) REFERENCES agregados(id)
     )
@@ -107,12 +110,19 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE UNIQUE INDEX IF NOT EXISTS u_agregados_levels_pair
     ON agregados_levels(agregado_id, level_id)
     """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_periods_agregado_ord
+    ON periods(agregado_id, periodo_ord)
+    """,
 )
 
 ADDITIONAL_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("agregados", "municipality_locality_count", "INTEGER DEFAULT 0"),
     ("agregados", "covers_national_municipalities", "INTEGER DEFAULT 0"),
     ("agregados_levels", "locality_count", "INTEGER DEFAULT 0"),
+    # NEW — add both:
+    ("periods", "periodo_ord", "INTEGER"),
+    ("periods", "periodo_kind", "TEXT"),
 )
 
 
