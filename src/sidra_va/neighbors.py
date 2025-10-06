@@ -1,3 +1,5 @@
+##COMPLETELY IRRELEVANT CODE THAT WILL BE DROPPED SOON.READ plan_sidra_search_unified_cli_name_keys.md
+
 from __future__ import annotations
 
 from typing import Mapping
@@ -6,6 +8,7 @@ from .db import create_connection
 from .schema_migrations import apply_va_schema
 from .search_va import VaResult
 from .synonyms import normalize_basic
+from .fingerprints import variable_fingerprint
 
 
 def _levels(row) -> set[str]:
@@ -46,7 +49,16 @@ def _load_dims(conn, va_ids: list[str]) -> dict[str, list[Mapping[str, str]]]:
 
 
 def _compat_score(seed, candidate, seed_dims, candidate_dims, require_same_unit: bool) -> float:
-    var_compat = 1.0 if seed["variable_id"] == candidate["variable_id"] else 0.9 if seed["fingerprint"] == candidate["fingerprint"] else 0.0
+    # compute fallback fingerprints if missing (robust to partial indexes)
+    seed_fp = seed["fingerprint"] or variable_fingerprint(
+        seed["variable_name"] or "", seed["variable_unit"], None
+    )
+    cand_fp = candidate["fingerprint"] or variable_fingerprint(
+        candidate["variable_name"] or "", candidate["variable_unit"], None
+    )
+
+    var_compat = 1.0 if seed["variable_id"] == candidate["variable_id"] else 0.9 if seed_fp == cand_fp else 0.0
+
     unit_seed = seed["unit"] or ""
     unit_candidate = candidate["unit"] or ""
     if require_same_unit and normalize_basic(unit_seed) != normalize_basic(unit_candidate):
@@ -54,9 +66,7 @@ def _compat_score(seed, candidate, seed_dims, candidate_dims, require_same_unit:
     unit_compat = 1.0 if normalize_basic(unit_seed) == normalize_basic(unit_candidate) else 0.5 if unit_seed and unit_candidate else 0.0
 
     seed_cats = {normalize_basic(dim["category_name"]) for dim in seed_dims if dim["category_name"]}
-    cand_cats = {
-        normalize_basic(dim["category_name"]) for dim in candidate_dims if dim["category_name"]
-    }
+    cand_cats = {normalize_basic(dim["category_name"]) for dim in candidate_dims if dim["category_name"]}
     if seed_cats or cand_cats:
         union = seed_cats | cand_cats
         dim_compat = (len(seed_cats & cand_cats) / len(union)) if union else 1.0
@@ -94,6 +104,8 @@ def find_neighbors_for_va(
     conn = create_connection()
     try:
         apply_va_schema(conn)
+
+        # --- seed row
         cursor = conn.execute(
             """
             SELECT va.va_id, va.agregado_id, va.variable_id, va.unit, va.text, va.dims_json,
@@ -106,7 +118,8 @@ def find_neighbors_for_va(
             JOIN agregados AS ag ON ag.id = va.agregado_id
             JOIN variables AS var
                 ON var.id = va.variable_id AND var.agregado_id = va.agregado_id
-            LEFT JOIN variable_fingerprints AS vf ON vf.variable_id = va.variable_id
+            LEFT JOIN variable_fingerprints AS vf
+                ON vf.variable_id = va.variable_id AND vf.agregado_id = va.agregado_id
             WHERE va.va_id = ?
             """,
             (seed_va_id,),
@@ -114,9 +127,16 @@ def find_neighbors_for_va(
         seed_row = cursor.fetchone()
         if not seed_row:
             return []
+
+        # compute a non-null seed fingerprint for downstream filtering
+        seed_fp = seed_row["fingerprint"] or variable_fingerprint(
+            seed_row["variable_name"] or "", seed_row["variable_unit"], None
+        )
+
         seed_dims_map = _load_dims(conn, [seed_va_id])
         seed_dims = seed_dims_map.get(seed_va_id, [])
 
+        # --- candidates
         cursor = conn.execute(
             """
             SELECT va.va_id, va.agregado_id, va.variable_id, va.unit, va.text, va.dims_json,
@@ -127,23 +147,38 @@ def find_neighbors_for_va(
                    var.nome AS variable_name, var.unidade AS variable_unit
             FROM value_atoms AS va
             JOIN agregados AS ag ON ag.id = va.agregado_id
-            JOIN variables AS var ON var.id = va.variable_id
-            LEFT JOIN variable_fingerprints AS vf ON vf.variable_id = va.variable_id
-            WHERE va.va_id != ? AND (va.variable_id = ? OR vf.fingerprint = ?)
+            JOIN variables AS var
+                ON var.id = va.variable_id AND var.agregado_id = va.agregado_id
+            LEFT JOIN variable_fingerprints AS vf
+                ON vf.variable_id = va.variable_id AND vf.agregado_id = va.agregado_id
+            WHERE va.va_id != ?
+              AND (va.variable_id = ? OR vf.fingerprint = ?)
             """,
-            (seed_va_id, seed_row["variable_id"], seed_row["fingerprint"]),
+            (seed_va_id, seed_row["variable_id"], seed_fp),
         )
         candidates = cursor.fetchall()
         dims_map = _load_dims(conn, [row["va_id"] for row in candidates])
     finally:
         conn.close()
 
+    # ensure seed row has a concrete fingerprint for scoring
+    if not seed_row["fingerprint"]:
+        seed_row = dict(seed_row)
+        seed_row["fingerprint"] = seed_fp  # type: ignore[index]
+
     neighbors: list[tuple[VaResult, float]] = []
     for cand in candidates:
+        # ensure candidate has a fingerprint for scoring
+        if not cand["fingerprint"]:
+            c = dict(cand)
+            c["fingerprint"] = variable_fingerprint(c["variable_name"] or "", c["variable_unit"], None)
+            cand = c  # type: ignore[assignment]
+
         cand_dims = dims_map.get(cand["va_id"], [])
         score = _compat_score(seed_row, cand, seed_dims, cand_dims, require_same_unit)
         if score <= 0:
             continue
+
         title = cand["variable_name"]
         if cand_dims:
             title += " | " + ", ".join(
@@ -151,6 +186,7 @@ def find_neighbors_for_va(
             )
         if cand["unit"]:
             title += f" ({cand['unit']})"
+
         metadata = {
             "survey": cand["survey"] or "",
             "subject": cand["subject"] or "",
@@ -159,6 +195,7 @@ def find_neighbors_for_va(
             "period_end": cand["period_end"] or "",
         }
         why = f"compat={score:.2f}; variable={'same' if cand['variable_id']==seed_row['variable_id'] else 'fingerprint'}"
+
         neighbors.append(
             (
                 VaResult(

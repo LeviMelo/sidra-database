@@ -145,7 +145,11 @@ async def search_tables(
             for (a, b) in class_pairs_strict
             if b and normalize_basic(a) and normalize_basic(b)
         ]
-
+        
+        # Keep originals for co-occurrence enforcement
+        var_keys_required = set(var_keys_strict)
+        class_keys_required = set(class_keys_strict)
+        
         # ---- candidate tables (strict first)
         candidates: Optional[Set[int]] = None
 
@@ -176,29 +180,58 @@ async def search_tables(
                 for v in args.vars:
                     hits = similar_keys("var", v, threshold=args.var_th, top_k=5)
                     for key, _score in hits:
-                        expanded_v.add(key)
                         if key not in var_keys_strict:
+                            expanded_v.add(key)
                             fuzzy_used_vars.add(key)
+
                 if expanded_v != var_keys_strict:
-                    ids = _tables_for_var_keys(conn, sorted(expanded_v))
+                    # strict: require all strict keys (via intersection across calls to _tables_for_var_keys)
+                    strict_ids = _tables_for_var_keys(conn, sorted(var_keys_strict))
+
+                    # fuzzy: union of tables that match ANY fuzzy-only key
+                    fuzzy_only = sorted(expanded_v - var_keys_strict)
+                    fuzzy_ids: set[int] = set()
+                    for k in fuzzy_only:
+                        rows = conn.execute(
+                            "SELECT DISTINCT table_id FROM link_var WHERE var_key = ?",
+                            (k,),
+                        ).fetchall()
+                        fuzzy_ids |= {int(r[0]) for r in rows}
+
+                    ids = (strict_ids | fuzzy_ids) if strict_ids else fuzzy_ids
                     candidates = ids if candidates is None else candidates & ids
-                    var_keys_strict = expanded_v
+                    # keep var_keys_strict unchanged so enforcement uses originals
+
 
             if class_keys_strict:
                 expanded_c = set(class_keys_strict)
                 for c_raw, _cat in class_pairs_strict:
                     hits = similar_keys("class", c_raw, threshold=args.class_th, top_k=5)
                     for key, _score in hits:
-                        expanded_c.add(key)
                         if key not in class_keys_strict:
+                            expanded_c.add(key)
                             fuzzy_used_classes.add(key)
+
                 if expanded_c != class_keys_strict:
-                    ids = _tables_for_class_keys(conn, sorted(expanded_c))
+                    strict_ids = _tables_for_class_keys(conn, sorted(class_keys_strict))
+
+                    fuzzy_only = sorted(expanded_c - class_keys_strict)
+                    fuzzy_ids: set[int] = set()
+                    for k in fuzzy_only:
+                        rows = conn.execute(
+                            "SELECT DISTINCT table_id FROM link_class WHERE class_key = ?",
+                            (k,),
+                        ).fetchall()
+                        fuzzy_ids |= {int(r[0]) for r in rows}
+
+                    ids = (strict_ids | fuzzy_ids) if strict_ids else fuzzy_ids
                     candidates = ids if candidates is None else candidates & ids
-                    class_keys_strict = expanded_c
-                # re-enforce with expanded class keys
-                if candidates and var_keys_strict and class_keys_strict:
-                    candidates = _enforce_var_class(conn, candidates, var_keys_strict, class_keys_strict)
+                    # keep class_keys_strict unchanged so enforcement uses originals
+
+                # Enforce var×class co-occurrence ONLY for the strict originals
+                if candidates and var_keys_required and class_keys_required:
+                    candidates = _enforce_var_class(conn, candidates, var_keys_required, class_keys_required)
+
 
         # no structural constraints → start from all tables (title/coverage can still filter)
         if candidates is None:

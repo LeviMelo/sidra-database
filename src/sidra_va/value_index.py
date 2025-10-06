@@ -1,3 +1,5 @@
+##COMPLETELY IRRELEVANT CODE THAT WILL BE DROPPED SOON.READ plan_sidra_search_unified_cli_name_keys.md
+
 from __future__ import annotations
 
 import asyncio
@@ -126,7 +128,7 @@ def _build_va_index_for_agregado_sync(
                         created_at,
                     )
 
-            _upsert_fingerprint(conn, variable, synonyms)
+            _upsert_fingerprint(conn, agregado_id, variable, None)
         return total
     finally:
         conn.close()
@@ -263,20 +265,46 @@ def _upsert_va(
     return 1
 
 
-def _upsert_fingerprint(conn, variable: _Variable, synonyms: SynonymMap) -> None:
-    fingerprint = variable_fingerprint(variable.name, variable.unit, synonyms)
-    run_with_retries(
-        lambda: _write_fingerprint(conn, variable.id, fingerprint)
+def _upsert_fingerprint(conn, agregado_id, variable, synonyms=None) -> None:
+    """
+    Upsert (agregado_id, variable_id) -> fingerprint.
+    Accepts either our _Variable dataclass or a sqlite row/dict.
+    """
+    # id
+    vid = getattr(variable, "id", None)
+    if vid is None and isinstance(variable, dict):
+        vid = variable.get("id")
+    if vid is None:
+        raise ValueError("variable.id missing in _upsert_fingerprint")
+
+    # name: prefer 'name' (dataclass), fall back to 'nome' (db row)
+    vname = getattr(variable, "name", None)
+    if vname is None and hasattr(variable, "nome"):
+        vname = getattr(variable, "nome")  # type: ignore[attr-defined]
+    if vname is None and isinstance(variable, dict):
+        vname = variable.get("name") or variable.get("nome")
+
+    # unit: prefer 'unit' (dataclass), fall back to 'unidade' (db row)
+    vunit = getattr(variable, "unit", None)
+    if vunit is None and hasattr(variable, "unidade"):
+        vunit = getattr(variable, "unidade")  # type: ignore[attr-defined]
+    if vunit is None and isinstance(variable, dict):
+        vunit = variable.get("unit") or variable.get("unidade")
+
+    fp = variable_fingerprint(str(vname or ""), vunit, synonyms)
+    run_with_retries(lambda: _write_fingerprint(conn, int(agregado_id), int(vid), fp))
+
+
+def _write_fingerprint(conn, agregado_id: int, variable_id: int, fingerprint: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO variable_fingerprints (agregado_id, variable_id, fingerprint)
+        VALUES (?, ?, ?)
+        ON CONFLICT(agregado_id, variable_id) DO UPDATE
+            SET fingerprint = excluded.fingerprint
+        """,
+        (agregado_id, variable_id, fingerprint),
     )
-
-
-def _write_fingerprint(conn, variable_id: int, fingerprint: str) -> None:
-    with conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO variable_fingerprints(variable_id, fingerprint) VALUES(?, ?)",
-            (variable_id, fingerprint),
-        )
-
 
 def _load_variables(conn, agregado_id: int) -> list[_Variable]:
     cursor = conn.execute(
