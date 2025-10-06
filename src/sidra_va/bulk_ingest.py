@@ -12,6 +12,8 @@ from .db import ensure_full_schema, sqlite_session
 from .discovery import CatalogEntry, fetch_catalog_entries, filter_catalog_entries
 from .embedding_client import EmbeddingClient
 from .ingest_base import generate_embeddings_for_agregado, ingest_agregado
+from .coverage import parse_coverage_expr, extract_levels, eval_coverage
+from .utils import utcnow_iso
 
 
 @dataclass(slots=True)
@@ -73,6 +75,70 @@ async def discover_agregados_by_coverage(
         return filtered[:limit]
     return filtered
 
+async def _probe_counts_and_prefetch(
+    entries: Sequence[CatalogEntry],
+    levels_to_probe: set[str],
+    *,
+    client: SidraApiClient,
+    concurrency: int = 16,
+    progress_callback: Callable[[str], None] | None = None,
+) -> tuple[dict[int, dict[str, int]], dict[int, dict[str, list[dict]]]]:
+    """
+    For each catalog entry, fetch localities for the requested levels and compute counts.
+    We do NOT trust the catalog to enumerate supported levels; we try the levels
+    mentioned in the coverage expression. Failures/404s are treated as empty lists.
+    Returns:
+      (counts_map, prefetch_map)
+        counts_map[agregado_id][level_code] -> int
+        prefetch_map[agregado_id][level_code] -> list[locality_dict]
+    """
+    sem = asyncio.Semaphore(max(1, concurrency))
+    counts_map: dict[int, dict[str, int]] = {}
+    prefetch_map: dict[int, dict[str, list[dict]]] = {}
+
+    total = len(entries)
+    processed = 0
+    emit_every = max(50, total // 20)  # ~5% or at least every 50
+    last_emit = time.monotonic()
+
+    async def _one(entry: CatalogEntry) -> None:
+        nonlocal processed, last_emit
+        entry_counts: dict[str, int] = {}
+        entry_prefetch: dict[str, list[dict]] = {}
+        needed = [lvl.upper() for lvl in levels_to_probe]
+        for lvl in needed:
+            async with sem:
+                try:
+                    payload = await client.fetch_localities(entry.id, lvl)
+                    if not isinstance(payload, list):
+                        try:
+                            payload = list(payload)
+                        except Exception:
+                            payload = []
+                except Exception:
+                    payload = []
+                entry_counts[lvl] = len(payload)
+                entry_prefetch[lvl] = payload
+        counts_map[entry.id] = entry_counts
+        prefetch_map[entry.id] = entry_prefetch
+
+        processed += 1
+        if progress_callback:
+            now = time.monotonic()
+            if (
+                processed <= 10
+                or processed == total
+                or processed % emit_every == 0
+                or (now - last_emit) >= 5.0
+            ):
+                last_emit = now
+                progress_callback(f"Probing progress {processed}/{total} ({processed*100//max(1,total)}%)")
+
+    await asyncio.gather(*(_one(e) for e in entries))
+    if progress_callback:
+        progress_callback(f"Probed locality counts for {total} agregados across {len(levels_to_probe)} levels.")
+    return counts_map, prefetch_map
+
 
 async def ingest_by_coverage(
     *,
@@ -89,6 +155,8 @@ async def ingest_by_coverage(
     embedding_client: EmbeddingClient | None = None,
     progress_callback: Callable[[str], None] | None = None,
     generate_embeddings: bool = True,
+    coverage_expr: str | None = None,
+    probe_concurrency: int = 16,
 ) -> BulkIngestionReport:
     """Discover agregados using coverage filters and ingest them."""
 
@@ -119,6 +187,37 @@ async def ingest_by_coverage(
             limit=limit,
         )
         report.discovered_ids = [entry.id for entry in candidates]
+        # Optional: client-time coverage filtering using a boolean expression
+        prefetch_map: dict[int, dict[str, list[dict]]] = {}
+        if coverage_expr:
+            try:
+                ast = parse_coverage_expr(coverage_expr)
+            except Exception as exc:
+                _emit(f"Invalid --coverage expression: {exc}")
+                return report
+
+            needed_levels = extract_levels(ast)
+            if not needed_levels:
+                _emit("Coverage expression has no level identifiers; skipping coverage probe.")
+            else:
+                _emit(f"Probing coverage levels {sorted(needed_levels)} for {len(candidates)} candidates...")
+                counts_map, prefetch_map = await _probe_counts_and_prefetch(
+                    candidates,
+                    needed_levels,
+                    client=client,
+                    concurrency=max(1, probe_concurrency),
+                    progress_callback=_emit,
+                )
+
+                # Keep only entries that satisfy the expression
+                filtered: list[CatalogEntry] = []
+                for entry in candidates:
+                    counts = counts_map.get(entry.id, {})
+                    if eval_coverage(ast, counts):
+                        filtered.append(entry)
+                candidates = filtered
+                report.discovered_ids = [e.id for e in candidates]
+                _emit(f"Coverage expression kept {len(candidates)} agregados.")
 
         existing_ids: set[int] = set()
         if skip_existing:
@@ -165,6 +264,7 @@ async def ingest_by_coverage(
                         embedding_client=embedding_client,
                         generate_embeddings=False,
                         db_lock=db_lock,
+                        prefetched_localities=prefetch_map.get(agregado_id),
                     )
                 except Exception as exc:  # noqa: BLE001
                     report.failed.append((agregado_id, str(exc)))
@@ -210,9 +310,31 @@ async def ingest_by_coverage(
                             embedding_client=embed_client,
                             db_lock=embed_lock,
                         )
+                        # Log success
+                        ts = utcnow_iso()
+                        with sqlite_session() as conn:
+                            with conn:
+                                conn.execute(
+                                    """
+                                    INSERT INTO ingestion_log (agregado_id, stage, status, detail, run_at)
+                                    VALUES (?, ?, ?, ?, ?)
+                                    """,
+                                    (agregado_id, "embedding", "success", None, ts),
+                                )
                     except Exception as exc:  # noqa: BLE001
                         report.failed.append((agregado_id, f"embedding: {exc}"))
                         _emit(f"Embedding failed for {agregado_id}: {exc}")
+                        # Log failure
+                        ts = utcnow_iso()
+                        with sqlite_session() as conn:
+                            with conn:
+                                conn.execute(
+                                    """
+                                    INSERT INTO ingestion_log (agregado_id, stage, status, detail, run_at)
+                                    VALUES (?, ?, ?, ?, ?)
+                                    """,
+                                    (agregado_id, "embedding", "error", str(exc)[:200], ts),
+                                )
                     finally:
                         completed_embeds += 1
                         now = time.monotonic()
@@ -223,9 +345,8 @@ async def ingest_by_coverage(
                             or (now - embed_last_progress) >= progress_time_budget
                         ):
                             embed_last_progress = now
-                            _emit(
-                                f"Embedding progress {completed_embeds}/{embed_total}"
-                            )
+                            _emit(f"Embedding progress {completed_embeds}/{embed_total}")
+
 
             _emit(
                 f"Generating embeddings for {len(report.ingested_ids)} agregados"

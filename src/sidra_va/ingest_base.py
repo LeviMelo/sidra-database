@@ -210,7 +210,9 @@ async def ingest_agregado(
     embedding_client: EmbeddingClient | None = None,
     generate_embeddings: bool = True,
     db_lock: asyncio.Lock | None = None,
+    prefetched_localities: dict[str, list[dict[str, Any]]] | None = None,
 ) -> None:
+
     """Fetch and persist metadata for a single agregados table."""
 
     own_client = False
@@ -242,22 +244,37 @@ async def ingest_agregado(
             _log_ingestion_status(agregado_id, "error", "api")
             raise
 
-        nivel_groups_raw = metadata.get("nivelTerritorial", {}) or {}
+        # --- derive territorial levels from metadata
+        nivel_groups_raw = metadata.get("nivelTerritorial") or {}
         nivel_groups = nivel_groups_raw if isinstance(nivel_groups_raw, dict) else {}
 
         municipality_locality_count: int = 0
         level_rows: list[tuple[int, str, str | None, str, int]] = []
         locality_rows: list[tuple[int, str, str | None, str | None]] = []
+
         for level_type, codes in nivel_groups.items():
             if not codes:
                 continue
             for level_code in codes:
-                try:
-                    localities = await client.fetch_localities(agregado_id, level_code)
-                except Exception:
-                    _log_ingestion_status(agregado_id, "error", "api")
-                    raise
-                raw_payload = localities or []
+                # Prefer prefetched localities for this level if provided
+                payload_list = None
+                if prefetched_localities and isinstance(prefetched_localities, dict):
+                    payload_list = (
+                        prefetched_localities.get(str(level_code))
+                        or prefetched_localities.get(str(level_code).upper())
+                    )
+
+                if payload_list is None:
+                    try:
+                        localities = await client.fetch_localities(agregado_id, level_code)
+                    except Exception:
+                        _log_ingestion_status(agregado_id, "error", "api")
+                        raise
+                    raw_payload = localities or []
+                else:
+                    raw_payload = payload_list or []
+
+                # Normalize to list of dicts
                 if isinstance(raw_payload, list):
                     payload = raw_payload
                 else:
@@ -265,18 +282,21 @@ async def ingest_agregado(
                         payload = list(raw_payload)
                     except TypeError:
                         payload = []
+
                 count = len(payload)
-                if level_code.upper() == MUNICIPALITY_LEVEL_CODE and count > municipality_locality_count:
+                if str(level_code).upper() == MUNICIPALITY_LEVEL_CODE and count > municipality_locality_count:
                     municipality_locality_count = count
+
                 level_name = None
                 if payload:
                     level_name = (payload[0].get("nivel", {}) or {}).get("nome")
+
                 level_rows.append(
                     (
                         agregado_id,
-                        level_code,
+                        str(level_code),
                         level_name,
-                        level_type,
+                        str(level_type),
                         count,
                     )
                 )
@@ -284,7 +304,7 @@ async def ingest_agregado(
                     locality_rows.append(
                         (
                             agregado_id,
-                            level_code,
+                            str(level_code),
                             loc.get("id"),
                             loc.get("nome"),
                         )

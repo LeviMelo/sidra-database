@@ -103,6 +103,10 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
     CREATE INDEX IF NOT EXISTS idx_localities_agregado ON localities(agregado_id, level_id)
     """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS u_agregados_levels_pair
+    ON agregados_levels(agregado_id, level_id)
+    """,
 )
 
 ADDITIONAL_COLUMNS: tuple[tuple[str, str, str], ...] = (

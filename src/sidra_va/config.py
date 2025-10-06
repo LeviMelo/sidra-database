@@ -17,7 +17,7 @@ class VaSettings:
     request_retries: int = 3
     user_agent: str = "sidra-va/0.1"
     database_timeout: float = 60.0
-    municipality_national_threshold: int = 0
+    municipality_national_threshold: int = 5000 # <— default to full coverage
 
 
 def _lookup_env(name: str) -> str | None:

@@ -17,6 +17,7 @@ from .embedding_client import EmbeddingClient
 from .ingest_base import ingest_agregado
 from .neighbors import find_neighbors_for_va
 from .schema_migrations import apply_va_schema, get_schema_version
+from .base_schema import apply_base_schema
 from .search_va import VaResult, VaSearchFilters, search_value_atoms
 from .synonyms import export_synonyms_csv, import_synonyms_csv
 from .value_index import build_va_index_for_agregado, build_va_index_for_all
@@ -25,6 +26,8 @@ from .value_index import build_va_index_for_agregado, build_va_index_for_all
 def _ensure_va_schema() -> None:
     conn = create_connection()
     try:
+        # Ensure the base SIDRA tables exist before VA tables/indexes
+        apply_base_schema(conn)
         apply_va_schema(conn)
         conn.commit()
     finally:
@@ -217,7 +220,7 @@ def cmd_ingest_coverage(args: argparse.Namespace) -> None:
     _ensure_va_schema()
 
     def _progress(message: str) -> None:
-        print(message)
+       print(message, flush=True)
 
     report = asyncio.run(
         ingest_by_coverage(
@@ -232,8 +235,11 @@ def cmd_ingest_coverage(args: argparse.Namespace) -> None:
             dry_run=args.dry_run,
             generate_embeddings=not args.skip_embeddings,
             progress_callback=_progress,
+            coverage_expr=args.coverage,
+            probe_concurrency=args.probe_concurrent,
         )
     )
+
 
     summary = {
         "discovered": len(report.discovered_ids),
@@ -514,7 +520,7 @@ def cmd_show_table(args: argparse.Namespace) -> None:
         )
         for vid, nome, unidade in cursor.fetchall():
             print(f"  {vid}: {nome} ({unidade or 'sem unidade'})")
-        print("Classificações (top 10 categorias):")
+        print("Classificações:")
         cursor = conn.execute(
             "SELECT id, nome FROM classifications WHERE agregado_id = ? ORDER BY id",
             (args.agregado_id,),
@@ -525,7 +531,7 @@ def cmd_show_table(args: argparse.Namespace) -> None:
                 """
                 SELECT categoria_id, nome FROM categories
                 WHERE agregado_id = ? AND classification_id = ?
-                ORDER BY categoria_id LIMIT 10
+                ORDER BY categoria_id
                 """,
                 (args.agregado_id, cid),
             )
@@ -673,6 +679,9 @@ def build_parser() -> argparse.ArgumentParser:
     coverage_parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false")
     coverage_parser.set_defaults(skip_existing=True)
     coverage_parser.set_defaults(func=cmd_ingest_coverage)
+    coverage_parser.add_argument("--coverage", dest="coverage", help="Boolean coverage expression, e.g. '(N3>=27) AND (N6>=5000 OR N4>10)'",)
+    coverage_parser.add_argument("--probe-concurrent", dest="probe_concurrent", type=int, default=16, help="Concurrency for coverage probing (fetching localidades for candidate tables).",)
+   
 
     repair_parser = subparsers.add_parser(
         "repair-missing",

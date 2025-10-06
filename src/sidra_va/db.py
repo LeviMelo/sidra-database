@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Iterator
 
 from .config import get_settings
+from .base_schema import apply_base_schema
+from .schema_migrations import apply_va_schema
 
 
 def _has_base_tables(path: Path) -> bool:
@@ -73,11 +75,13 @@ def create_connection() -> sqlite3.Connection:
         check_same_thread=False,
     )
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=NORMAL")
     busy_timeout_ms = max(int(timeout * 1000), 60000)
     connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
     return connection
+
 
 
 @contextmanager
@@ -88,6 +92,17 @@ def sqlite_session() -> Iterator[sqlite3.Connection]:
     finally:
         connection.close()
 
+def ensure_full_schema() -> None:
+    """Create/upgrade both base (SIDRA) and VA schema objects."""
+    conn = create_connection()
+    try:
+        apply_base_schema(conn)   # base SIDRA tables
+        apply_va_schema(conn)     # VA additive tables/indexes
+        conn.commit()
+    finally:
+        conn.close()
 
-__all__ = ["create_connection", "get_database_path", "sqlite_session"]
+
+__all__ = ["create_connection", "get_database_path", "sqlite_session", "ensure_full_schema"]
+
 

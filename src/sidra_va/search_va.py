@@ -151,7 +151,7 @@ async def search_value_atoms(
 
         semantic_ranks: Dict[str, int] = {}
         semantic_rrf_scores: Dict[str, float] = {}
-        query_vector: list[float] | None = None
+        query_vector: Sequence[float] | None = None
         structural_candidates = _structural_candidate_ids(conn, filters)
         embedding_candidate_ids: set[str] | None = None
         if structural_candidates is not None:
