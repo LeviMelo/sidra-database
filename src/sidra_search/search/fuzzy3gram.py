@@ -77,7 +77,15 @@ def similar_keys(
     if not choices:
         return []
 
-    cutoff = max(0, min(100, int(round(threshold * 100.0))))
+    # Adaptive threshold: for short one-token queries (e.g., "pessoal"),
+    # allow a bit more fuzz so it can hit "pessoas", etc.
+    tok_count = len(q.split())
+    qlen = len(q.replace(" ", ""))
+    eff_th = float(threshold)
+    if tok_count == 1 and qlen <= 8:
+        eff_th = min(eff_th, 0.72)  # relax to 0.72 if default is higher
+    cutoff = max(0, min(100, int(round(eff_th * 100.0))))
+
 
     # Pass 1 — strict (user cutoff)
     results = process.extract(
@@ -95,6 +103,7 @@ def similar_keys(
         results = process.extract(
             q, choices, scorer=fuzz.WRatio, limit=max(10, top_k * 5)
         )
+        
 
     out: List[Tuple[str, float]] = [(key, float(score) / 100.0) for (key, score, _idx) in results]
 

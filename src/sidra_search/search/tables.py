@@ -40,6 +40,7 @@ class SearchArgs:
     var_th: float
     class_th: float
     semantic: bool    # use embeddings for titles
+    debug_fuzzy: bool  # NEW
 
 
 def _split_class(spec: str) -> Tuple[str, Optional[str]]:
@@ -156,6 +157,15 @@ async def search_tables(
             class_exact.append(ck_exact or "")
             class_cat_per_group.append(catk)
 
+        # ---------- Inspect fuzzy expansions (debug) ----------
+        if args.debug_fuzzy:
+            top_vars = sorted(var_cand_score.items(), key=lambda x: x[1], reverse=True)[:12]
+            print("[fuzzy] var:", ", ".join(f"{k}:{s:.2f}" for k,s in top_vars) or "(none)")
+            for i, grp in enumerate(class_groups):
+                top_cls = sorted(grp.items(), key=lambda x: x[1], reverse=True)[:12]
+                print(f"[fuzzy] class[{i}]:", ", ".join(f"{k}:{s:.2f}" for k,s in top_cls) or "(none)")
+
+
         # ---------- Initial candidate tables ----------
         candidates: Optional[Set[int]] = None
 
@@ -164,9 +174,19 @@ async def search_tables(
             ids = _union_tables_for_keys(conn, "link_var", "var_key", var_cand_score.keys())
             candidates = ids if candidates is None else (candidates & ids)
 
+            # Intersect early with class presence if classes were requested
+            if class_groups:
+                groups_sets = [set(g.keys()) for g in class_groups if g]
+                if groups_sets:
+                    cls_ids = _intersect_groups_union_inside(conn, "link_class", "class_key", groups_sets)
+                    candidates = candidates & cls_ids
+                    if not candidates:
+                        return []
+
+                
         # If classes-only: intersect across groups (union inside)
         if not var_cand_score and class_groups:
-            groups_sets = [set(g) for g in class_groups]
+            groups_sets = [set(g.keys()) for g in class_groups if g]
             ids = _intersect_groups_union_inside(conn, "link_class", "class_key", groups_sets)
             candidates = ids if candidates is None else (candidates & ids)
 

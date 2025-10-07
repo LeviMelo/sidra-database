@@ -188,34 +188,47 @@ async def _subject_gate_with_metadata(
 ) -> list["CatalogEntry"]:
     """
     Keep only entries whose SUBJECT matches `subject_contains`.
-    Prefer the subject already present in the catalog entry; otherwise
-    fetch /{id}/metadados and read 'assunto' there. Runs with bounded
-    concurrency and early-stops once enough are kept.
+    Prefer catalog subject; otherwise check local DB; otherwise fetch /{id}/metadados.
+    Bounded concurrency, early-stop, and progress ticks.
     """
     q = normalize_basic(subject_contains)
     if not q:
         return entries
 
+    total = len(entries)
     kept: list[CatalogEntry] = []
+    done = 0
+
+    print(f"[subject] filtering {total} entries by assunto~{subject_contains!r} (parallel={parallel})")
 
     async def check_one(e: CatalogEntry) -> tuple[CatalogEntry, bool]:
-        # 1) Try catalog-provided subject first
-        subj = normalize_basic(e.assunto or "")
-        if subj and q in subj:
+        # 0) DB cache (already ingested)
+        with sqlite_session() as conn:
+            row = conn.execute("SELECT assunto FROM agregados WHERE id=?", (e.id,)).fetchone()
+        if row and row[0]:
+            subj_db = normalize_basic(str(row[0] or ""))
+            if subj_db and (q in subj_db):
+                return e, True
+            # DB had a subject and it didn't match → skip network
+            return e, False
+
+        # 1) catalog-provided subject
+        subj_cat = normalize_basic(e.assunto or "")
+        if subj_cat and (q in subj_cat):
             return e, True
 
-        # 2) Fallback: fetch metadata subject
+        # 2) fallback: metadata
         per_table_timeout = max(10.0, 2.0 * float(get_settings().request_timeout))
         try:
             md = await asyncio.wait_for(client.fetch_metadata(e.id), timeout=per_table_timeout)
         except Exception:
             return e, False
 
-        subj2 = md.get("assunto")
-        if isinstance(subj2, dict):
-            subj2 = subj2.get("nome")
-        subj2 = normalize_basic(str(subj2 or ""))
-        return e, (q in subj2)
+        subj = md.get("assunto")
+        if isinstance(subj, dict):
+            subj = subj.get("nome")
+        subj = normalize_basic(str(subj or ""))
+        return e, (q in subj)
 
     sem = asyncio.Semaphore(max(1, int(parallel)))
     it = iter(entries)
@@ -238,20 +251,25 @@ async def _subject_gate_with_metadata(
         if not await schedule_next():
             break
 
-    # drain with early-stop
+    # drain with progress + early-stop
     while pending:
-        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-        for t in done:
+        done_set, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for t in done_set:
             e, ok = await t
+            done += 1
             if ok:
                 kept.append(e)
-                if need is not None and len(kept) >= need:
-                    pending.clear()
-                    break
+            if (done % 10 == 0) or (need and len(kept) >= need):
+                pct = (done * 100) // max(1, total)
+                print(f"\r[subject] checked={done}/{total} kept={len(kept)} ({pct}%)", end="", flush=True)
+            if need and len(kept) >= need:
+                pending.clear()
+                break
         while len(pending) < parallel:
             more = await schedule_next()
             if not more:
                 break
+    print()  # newline
 
     return kept
 

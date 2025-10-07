@@ -13,7 +13,7 @@ from ..ingest.links import build_links_for_table
 from ..net.embedding_client import EmbeddingClient
 from ..search.tables import SearchArgs, search_tables
 from ..search.fuzzy3gram import reset_cache
-
+from ..db.session import sqlite_session
 
 def _print_json(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2))
@@ -128,6 +128,7 @@ def _cmd_search_tables(args: argparse.Namespace) -> None:
         var_th=float(args.var_th),
         class_th=float(args.class_th),
         semantic=bool(args.semantic),
+        debug_fuzzy=bool(args.debug_fuzzy),
     )
     emb = EmbeddingClient() if args.semantic else None
     hits = asyncio.run(search_tables(sargs, embedding_client=emb))
@@ -151,18 +152,27 @@ def _cmd_search_tables(args: argparse.Namespace) -> None:
     if not hits:
         print("No results.")
         return
-    for h in hits:
-        period = ""
-        if h.period_start or h.period_end:
-            if h.period_start and h.period_end and h.period_start != h.period_end:
-                period = f" | {h.period_start}–{h.period_end}"
-            else:
-                period = f" | {h.period_start or h.period_end}"
-        cov = f" | N3={h.n3} N6={h.n6}" if (h.n3 or h.n6) else ""
-        print(f"{h.table_id}: {h.title}{period}{cov}")
-        if args.explain and h.why:
-            print("  matches:", " ".join(f"[{w}]" for w in h.why))
-            print(f"  score={h.score:.3f} (struct={h.struct_score:.3f}, rrf={h.rrf_score:.3f})")
+    with sqlite_session() as _conn:
+        for h in hits:
+            period = ""
+            if h.period_start or h.period_end:
+                if h.period_start and h.period_end and h.period_start != h.period_end:
+                    period = f" | {h.period_start}–{h.period_end}"
+                else:
+                    period = f" | {h.period_start or h.period_end}"
+            cov = f" | N3={h.n3} N6={h.n6}" if (h.n3 or h.n6) else ""
+            print(f"{h.table_id}: {h.title}{period}{cov}")
+
+            if args.show_classes:
+                names = [r[0] for r in _conn.execute(
+                    "SELECT nome FROM classifications WHERE agregado_id=? ORDER BY id LIMIT 3", (h.table_id,)
+                ).fetchall()]
+                if names:
+                    print("  classes:", "; ".join(names))
+
+            if args.explain and h.why:
+                print("  matches:", " ".join(f"[{w}]" for w in h.why))
+                print(f"  score={h.score:.3f} (struct={h.struct_score:.3f}, rrf={h.rrf_score:.3f})")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -214,7 +224,8 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--explain", action="store_true", help="print match rationale and scores")
     st.add_argument("--json", action="store_true")
     st.set_defaults(func=_cmd_search_tables)
-
+    st.add_argument("--show-classes", action="store_true", help="List up to 3 classification names for each hit")
+    st.add_argument("--debug-fuzzy", action="store_true", help="Print fuzzy expansions and candidate counts")
     return p
 
 
