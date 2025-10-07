@@ -208,7 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--coverage", help="boolean coverage expr, e.g. '(N6>=5000) AND (N3>=27)'")
     st.add_argument("--limit", type=int, default=20)
     st.add_argument("--no-fuzzy", action="store_true")
-    st.add_argument("--var-th", type=float, default=0.80)
+    st.add_argument("--var-th", type=float, default=0.74)
     st.add_argument("--class-th", type=float, default=0.78)
     st.add_argument("--semantic", action="store_true", help="use semantic title ranking (requires embeddings)")
     st.add_argument("--explain", action="store_true", help="print match rationale and scores")

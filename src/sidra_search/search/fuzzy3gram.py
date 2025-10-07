@@ -42,7 +42,7 @@ def _build() -> None:
         conn.close()
 
 
-def _rf_score(a: str, b: str) -> float:
+def _rf_score(a: str, b: str, **kwargs) -> float:
     """
     Blend a few RapidFuzz scorers (all 0..100) to cover:
       - substrings (partial_ratio),
@@ -66,9 +66,6 @@ def similar_keys(
     threshold: float,
     top_k: int = 10,
 ) -> List[Tuple[str, float]]:
-    """
-    Return [(normalized_key, score in 0..1)] of the best matches for the given kind.
-    """
     assert kind in ("var", "class")
     _build()
 
@@ -80,29 +77,31 @@ def similar_keys(
     if not choices:
         return []
 
-    # Use RapidFuzz's indexer for speed and quality, with our blended scorer.
-    # We over-fetch (×5) then cut to top_k after filtering by threshold.
+    cutoff = max(0, min(100, int(round(threshold * 100.0))))
+
+    # Pass 1 — strict (user cutoff)
     results = process.extract(
-        q,
-        choices,
-        scorer=_rf_score,
-        limit=max(10, top_k * 5),
-        score_cutoff=max(0.0, min(100.0, threshold * 100.0)),
+        q, choices, scorer=_rf_score, limit=max(10, top_k * 5), score_cutoff=cutoff
     )
+
+    # Pass 2 — if empty, slightly relax (−12 pts ~ 0.12)
+    if not results and len(q) <= 10:
+        results = process.extract(
+            q, choices, scorer=_rf_score, limit=max(10, top_k * 5), score_cutoff=max(0, cutoff - 12)
+        )
+
+    # Pass 3 — if still empty, try a robust single scorer (WRatio), no cutoff
+    if not results:
+        results = process.extract(
+            q, choices, scorer=fuzz.WRatio, limit=max(10, top_k * 5)
+        )
 
     out: List[Tuple[str, float]] = [(key, float(score) / 100.0) for (key, score, _idx) in results]
 
-    # Safe fallback: if nothing matched (e.g., extremely short queries with strict threshold),
-    # return simple substring-contains candidates ranked by relative length.
+    # Last resort — exact substring if still nothing
     if not out:
-        rel = []
-        for key in choices:
-            if q in key:
-                # Favor tighter matches
-                rel_score = len(q) / max(1, len(key))
-                rel.append((key, rel_score))
+        rel = [(key, len(q) / max(1, len(key))) for key in choices if q in key]
         rel.sort(key=lambda x: x[1], reverse=True)
         out = rel[:top_k]
 
-    # Final cut to top_k
     return out[:top_k]
