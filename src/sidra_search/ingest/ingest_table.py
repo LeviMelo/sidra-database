@@ -80,15 +80,17 @@ def _canonical_table_text(md: dict[str, Any]) -> str:
                 level_parts.append(f"{level_type}: {', '.join(str(c) for c in codes)}")
 
     lines = [
-        f"Table {md.get('id')}: {str(md.get('nome') or '').strip()}".strip(),
-        f"Survey: {md.get('pesquisa')}" if md.get("pesquisa") else None,
-        f"Subject: {md.get('assunto')}" if md.get("assunto") else None,
-        f"Frequency: {freq}" if freq else None,
+        f"Table {str(md.get('id'))}: {str(md.get('nome') or '').strip()}".strip(),
+        f"Survey: {str(md.get('pesquisa') or '')}" if md.get("pesquisa") else None,
+        f"Subject: {str(md.get('assunto') or '')}" if md.get("assunto") else None,
+        f"Frequency: {str(freq)}" if freq else None,
         period_line,
         f"Territorial levels: {'; '.join(level_parts)}" if level_parts else None,
-        f"URL: {md.get('URL')}" if md.get("URL") else None,
+        f"URL: {str(md.get('URL') or '')}" if md.get("URL") else None,
     ]
-    return "\n".join(l for l in lines if l)
+    # every yielded piece is a str; ignore falsy items
+    return "\n".join([s for s in lines if isinstance(s, str) and s])
+
 
 
 def _vec_to_blob(vec: Sequence[float]) -> bytes:
@@ -263,7 +265,7 @@ async def ingest_table(
                         cat.get("nome"),
                         cat.get("unidade"),
                         cat.get("nivel"),
-                        _sha256_text("||".join([str(cid), str(cat.get("id")), cat.get("nome",""), cat.get("unidade","")])),
+                        _hash_fields(cid, cat.get("id"), cat.get("nome"), cat.get("unidade")),  # <— here
                     )
                 )
 
@@ -404,9 +406,13 @@ async def ingest_table(
 
         # optional embeddings for title text
         if get_settings().enable_title_embeddings:
-            embedding_client = embedding_client or EmbeddingClient()
-            text = _canonical_table_text(md)
-            await _ensure_embeddings(table_id, text, embedding_client=embedding_client)
+            try:
+                embedding_client = embedding_client or EmbeddingClient()
+                text = _canonical_table_text(md)
+                await _ensure_embeddings(table_id, text, embedding_client=embedding_client)
+            except Exception:
+                # don't break ingestion if embeddings fail
+                pass
 
     finally:
         if own_client:

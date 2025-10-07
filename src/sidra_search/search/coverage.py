@@ -74,8 +74,12 @@ class _Parser:
         return self._cmp()
     def _cmp(self) -> Any:
         ident = self._eat('ID').value
+        # Allow bare identifiers like "N3" (shorthand for "N3 >= 1")
+        if self.cur.kind != 'OP':
+            return _Cmp('>=', ident, 1)
         op = self._eat('OP').value
-        if op == '=': op = '=='
+        if op == '=':
+            op = '=='
         number = int(self._eat('NUM').value)
         return _Cmp(op, ident, number)
 
@@ -88,7 +92,7 @@ def extract_levels(node: Any) -> set[str]:
         elif isinstance(n, _Not): _w(n.node)
         elif isinstance(n, (_And,_Or)): _w(n.left); _w(n.right)
     _w(node)
-    return out
+    return out      
 
 def eval_coverage(node: Any, counts: dict[str,int]) -> bool:
     def _cmp(op: str, a: int, b: int) -> bool:

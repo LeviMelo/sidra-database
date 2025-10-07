@@ -1,7 +1,9 @@
 Project structure for '/c/Users/Galaxy/LEVI/projects/sidra-database/src/sidra_search':
 ===============================================================================
   __init__.py
+  __main__.py
   cli/__init__.py
+  cli/__main__.py
   config.py
   db/__init__.py
   db/base_schema.py
@@ -26,385 +28,6 @@ Project structure for '/c/Users/Galaxy/LEVI/projects/sidra-database/src/sidra_se
 
 
 ###############################################################################
-### FILE: search/tables.py
-###############################################################################
-from __future__ import annotations
-
-import asyncio
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
-
-from ..db.session import create_connection
-from ..db.migrations import apply_search_schema
-from ..search.normalize import normalize_basic
-from ..search.coverage import parse_coverage_expr, extract_levels, eval_coverage
-from ..search.fuzzy3gram import similar_keys
-from ..search.title_rank import rrf
-from ..net.embedding_client import EmbeddingClient
-from ..config import get_settings
-
-
-@dataclass(frozen=True)
-class TableHit:
-    table_id: int
-    title: str
-    period_start: str | None
-    period_end: str | None
-    n3: int
-    n6: int
-    why: List[str]
-    score: float
-    rrf_score: float
-    struct_score: float
-
-
-@dataclass(frozen=True)
-class SearchArgs:
-    title: str | None
-    vars: Tuple[str, ...]
-    classes: Tuple[str, ...]   # "Class" or "Class:Category"
-    coverage: str | None
-    limit: int
-    allow_fuzzy: bool
-    var_th: float
-    class_th: float
-    semantic: bool    # use embeddings for titles
-
-
-def _split_class(spec: str) -> Tuple[str, Optional[str]]:
-    if ":" in spec:
-        a, b = spec.split(":", 1)
-        return a.strip(), b.strip()
-    return spec.strip(), None
-
-
-def _fts_query(text: str) -> str:
-    toks = [t for t in normalize_basic(text).split() if t]
-    return " ".join(toks)
-
-
-def _tables_for_key(conn, table: str, col: str, keys: Iterable[str]) -> Set[int]:
-    if not keys:
-        return set()
-    tables: Set[int] = set()
-    for key in keys:
-        rows = conn.execute(
-            f"SELECT DISTINCT table_id FROM {table} WHERE {col} = ?", (key,)
-        ).fetchall()
-        ids = {int(r[0]) for r in rows}
-        tables = ids if not tables else tables & ids
-    return tables
-
-
-def _tables_for_class_cat(conn, pairs: Iterable[Tuple[str, str]]) -> Set[int]:
-    if not pairs:
-        return set()
-    tables: Set[int] = set()
-    for ck, catk in pairs:
-        rows = conn.execute(
-            "SELECT DISTINCT table_id FROM link_cat WHERE class_key=? AND cat_key=?",
-            (ck, catk),
-        ).fetchall()
-        ids = {int(r[0]) for r in rows}
-        tables = ids if not tables else tables & ids
-    return tables
-
-
-def _enforce_var_class(conn, table_ids: Set[int], var_keys: Set[str], class_keys: Set[str]) -> Set[int]:
-    if not table_ids or not var_keys or not class_keys:
-        return table_ids
-    keep: Set[int] = set()
-    for tid in table_ids:
-        ok = True
-        for vk in var_keys:
-            for ck in class_keys:
-                row = conn.execute(
-                    """
-                    SELECT 1 FROM link_var_class
-                    WHERE table_id=? AND var_key=? AND class_key=?
-                    LIMIT 1
-                    """,
-                    (tid, vk, ck),
-                ).fetchone()
-                if not row:
-                    ok = False
-                    break
-            if not ok:
-                break
-        if ok:
-            keep.add(tid)
-    return keep
-
-
-async def search_tables(
-    args: SearchArgs,
-    *,
-    embedding_client: EmbeddingClient | None = None,
-) -> List[TableHit]:
-    conn = create_connection()
-    try:
-        apply_search_schema(conn)
-
-        # normalize inputs
-        var_keys_strict = {normalize_basic(v) for v in args.vars if normalize_basic(v)}
-        class_specs = [s for s in args.classes if s and s.strip()]
-        class_pairs = [_split_class(s) for s in class_specs]
-        class_keys_strict = {normalize_basic(a) for (a, b) in class_pairs if normalize_basic(a)}
-        class_cat_pairs = [
-            (normalize_basic(a), normalize_basic(b))
-            for (a, b) in class_pairs
-            if b and normalize_basic(a) and normalize_basic(b)
-        ]
-
-        # initial candidates (intersection)
-        candidates: Optional[Set[int]] = None
-
-        if var_keys_strict:
-            ids = _tables_for_key(conn, "link_var", "var_key", sorted(var_keys_strict))
-            candidates = ids if candidates is None else candidates & ids
-
-        if class_keys_strict:
-            ids = _tables_for_key(conn, "link_class", "class_key", sorted(class_keys_strict))
-            candidates = ids if candidates is None else candidates & ids
-
-        if class_cat_pairs:
-            ids = _tables_for_class_cat(conn, class_cat_pairs)
-            candidates = ids if candidates is None else candidates & ids
-
-        # co-occurrence enforcement (strict only)
-        if candidates and var_keys_strict and class_keys_strict:
-            candidates = _enforce_var_class(conn, candidates, var_keys_strict, class_keys_strict)
-
-        # fuzzy expansions
-        fuzzy_used_vars: Set[str] = set()
-        fuzzy_used_classes: Set[str] = set()
-        if args.allow_fuzzy:
-            if var_keys_strict:
-                expanded = set(var_keys_strict)
-                for v in args.vars:
-                    for key, _ in similar_keys("var", v, threshold=args.var_th, top_k=8):
-                        if key not in var_keys_strict:
-                            expanded.add(key)
-                            fuzzy_used_vars.add(key)
-                if expanded != var_keys_strict:
-                    strict_ids = _tables_for_key(conn, "link_var", "var_key", sorted(var_keys_strict))
-                    fuzzy_only = sorted(expanded - var_keys_strict)
-                    fuzzy_ids: Set[int] = set()
-                    for k in fuzzy_only:
-                        rows = conn.execute("SELECT DISTINCT table_id FROM link_var WHERE var_key=?", (k,)).fetchall()
-                        fuzzy_ids |= {int(r[0]) for r in rows}
-                    ids = (strict_ids | fuzzy_ids) if strict_ids else fuzzy_ids
-                    candidates = ids if candidates is None else candidates & ids
-
-            if class_keys_strict:
-                expanded = set(class_keys_strict)
-                for c_raw, _ in class_pairs:
-                    for key, _ in similar_keys("class", c_raw, threshold=args.class_th, top_k=8):
-                        if key not in class_keys_strict:
-                            expanded.add(key)
-                            fuzzy_used_classes.add(key)
-                if expanded != class_keys_strict:
-                    strict_ids = _tables_for_key(conn, "link_class", "class_key", sorted(class_keys_strict))
-                    fuzzy_only = sorted(expanded - class_keys_strict)
-                    fuzzy_ids: Set[int] = set()
-                    for k in fuzzy_only:
-                        rows = conn.execute("SELECT DISTINCT table_id FROM link_class WHERE class_key=?", (k,)).fetchall()
-                        fuzzy_ids |= {int(r[0]) for r in rows}
-                    ids = (strict_ids | fuzzy_ids) if strict_ids else fuzzy_ids
-                    candidates = ids if candidates is None else candidates & ids
-
-                # keep strict var×class co-occurrence
-                if candidates and var_keys_strict and class_keys_strict:
-                    candidates = _enforce_var_class(conn, candidates, var_keys_strict, class_keys_strict)
-
-        # no structural facets? start from all tables
-        if candidates is None:
-            rows = conn.execute("SELECT id FROM agregados").fetchall()
-            candidates = {int(r[0]) for r in rows}
-
-        if not candidates:
-            return []
-
-        # coverage filter
-        if args.coverage:
-            try:
-                ast = parse_coverage_expr(args.coverage)
-            except Exception:
-                ast = None
-            if ast:
-                needed = extract_levels(ast)
-                keep: Set[int] = set()
-                for tid in candidates:
-                    rows = conn.execute(
-                        "SELECT level_id, locality_count FROM agregados_levels WHERE agregado_id=?",
-                        (tid,),
-                    ).fetchall()
-                    counts = {str(r["level_id"]).upper(): int(r["locality_count"] or 0) for r in rows}
-                    if eval_coverage(ast, counts):
-                        keep.add(tid)
-                candidates = keep
-                if not candidates:
-                    return []
-
-        # title ranking
-        lexical_ranks: Dict[int, int] = {}
-        semantic_ranks: Dict[int, int] = {}
-
-        if args.title and get_settings().enable_titles_fts:
-            q = _fts_query(args.title)
-            if q:
-                rows = conn.execute(
-                    """
-                    SELECT table_id FROM table_titles_fts
-                    WHERE table_titles_fts MATCH ?
-                    """,
-                    (q,),
-                ).fetchall()
-                order: List[int] = []
-                seen: Set[int] = set()
-                for r in rows:
-                    t = int(r[0])
-                    if t in candidates and t not in seen:
-                        seen.add(t); order.append(t)
-                    if len(order) >= args.limit * 5:
-                        break
-                lexical_ranks = {tid: idx + 1 for idx, tid in enumerate(order)}
-
-        if args.title and args.semantic and get_settings().enable_title_embeddings:
-            emb = embedding_client or EmbeddingClient()
-            qvec = await asyncio.to_thread(emb.embed_text, args.title, emb.model)
-            ordered = sorted(candidates)
-            placeholders = ",".join("?" for _ in ordered)
-            sql = (
-                f"SELECT entity_id, dimension, vector "
-                f"FROM embeddings WHERE entity_type='agregado' AND model=? AND entity_id IN ({placeholders})"
-            )
-            cur = conn.execute(sql, (emb.model, *ordered))
-
-            from array import array
-            import math
-
-            def to_vec(blob, dim):
-                arr = array("f"); arr.frombytes(blob); v = list(arr)
-                return v[:dim] if dim and len(v) > dim else v
-
-            def cosine(a: Sequence[float], b: Sequence[float]) -> float:
-                if not a or not b or len(a) != len(b): return 0.0
-                dot = sum(x*y for x,y in zip(a,b))
-                na = math.sqrt(sum(x*x for x in a))
-                nb = math.sqrt(sum(x*x for x in b))
-                return 0.0 if na==0 or nb==0 else dot/(na*nb)
-
-            sims: List[Tuple[int, float]] = []
-            for row in cur.fetchall():
-                tid = int(row["entity_id"])
-                vec = to_vec(row["vector"], int(row["dimension"]))
-                sim = cosine(qvec, vec)
-                if sim > 0:
-                    sims.append((tid, sim))
-            sims.sort(key=lambda x: x[1], reverse=True)
-            top = [tid for (tid, _s) in sims[: args.limit * 5]]
-            semantic_ranks = {tid: idx + 1 for idx, tid in enumerate(top)}
-
-        rrf_scores = rrf({**lexical_ranks, **semantic_ranks}, k=60.0)
-
-        def struct_score_for(tid: int) -> Tuple[float, List[str]]:
-            why: List[str] = []
-            score = 0.0
-
-            for vk in sorted(var_keys_strict):
-                row = conn.execute(
-                    "SELECT 1 FROM link_var WHERE table_id=? AND var_key=? LIMIT 1",
-                    (tid, vk),
-                ).fetchone()
-                if row:
-                    if vk in fuzzy_used_vars:
-                        score += 0.5; why.append(f'var≈"{vk}"')
-                    else:
-                        score += 1.0; why.append(f'var="{vk}"')
-
-            for ck in sorted(class_keys_strict):
-                row = conn.execute(
-                    "SELECT 1 FROM link_class WHERE table_id=? AND class_key=? LIMIT 1",
-                    (tid, ck),
-                ).fetchone()
-                if row:
-                    if ck in fuzzy_used_classes:
-                        score += 0.5; why.append(f'class≈"{ck}"')
-                    else:
-                        score += 1.0; why.append(f'class="{ck}"')
-
-            for (ck, catk) in class_cat_pairs:
-                row = conn.execute(
-                    "SELECT 1 FROM link_cat WHERE table_id=? AND class_key=? AND cat_key=? LIMIT 1",
-                    (tid, ck, catk),
-                ).fetchone()
-                if row:
-                    score += 0.5; why.append(f'{ck}:"{catk}"')
-
-            if var_keys_strict and class_keys_strict:
-                ok_all = True
-                for vk in var_keys_strict:
-                    for ck in class_keys_strict:
-                        row = conn.execute(
-                            "SELECT 1 FROM link_var_class WHERE table_id=? AND var_key=? AND class_key=? LIMIT 1",
-                            (tid, vk, ck),
-                        ).fetchone()
-                        if not row:
-                            ok_all = False; break
-                    if not ok_all: break
-                if ok_all:
-                    score += 0.5; why.append("var×class")
-
-            return score, why
-
-        hits: List[TableHit] = []
-        for tid in candidates:
-            row = conn.execute(
-                "SELECT id, nome, periodo_inicio, periodo_fim FROM agregados WHERE id=?",
-                (tid,),
-            ).fetchone()
-            if not row:
-                continue
-
-            n3r = conn.execute(
-                "SELECT COALESCE(locality_count,0) FROM agregados_levels WHERE agregado_id=? AND level_id='N3'",
-                (tid,),
-            ).fetchone()
-            n6r = conn.execute(
-                "SELECT COALESCE(locality_count,0) FROM agregados_levels WHERE agregado_id=? AND level_id='N6'",
-                (tid,),
-            ).fetchone()
-            n3 = int(n3r[0]) if n3r else 0
-            n6 = int(n6r[0]) if n6r else 0
-
-            struct, why = struct_score_for(tid)
-            rrf_score = float(rrf_scores.get(tid, 0.0))
-            final = 0.7 * struct + 0.3 * rrf_score
-
-            hits.append(
-                TableHit(
-                    table_id=int(row["id"]),
-                    title=str(row["nome"] or ""),
-                    period_start=row["periodo_inicio"],
-                    period_end=row["periodo_fim"],
-                    n3=n3,
-                    n6=n6,
-                    why=why,
-                    score=final,
-                    rrf_score=rrf_score,
-                    struct_score=struct,
-                )
-            )
-
-        hits.sort(key=lambda h: h.score, reverse=True)
-        return hits[: max(1, int(args.limit))]
-    finally:
-        conn.close()
-
-
-
-###############################################################################
 ### FILE: __init__.py
 ###############################################################################
 """sidra_search — table-centric search (titles + var/class links + fuzzy)."""
@@ -421,6 +44,16 @@ __all__ = [
 
 
 ###############################################################################
+### FILE: __main__.py
+###############################################################################
+from . import main
+
+if __name__ == "__main__":
+    main()
+
+
+
+###############################################################################
 ### FILE: cli/__init__.py
 ###############################################################################
 from __future__ import annotations
@@ -429,6 +62,7 @@ import argparse
 import asyncio
 import json
 from dataclasses import asdict
+from typing import Sequence  # <- added
 
 from ..db.session import ensure_full_schema, sqlite_session
 from ..ingest.ingest_table import ingest_table
@@ -436,12 +70,59 @@ from ..ingest.bulk import ingest_by_coverage
 from ..ingest.links import build_links_for_table
 from ..net.embedding_client import EmbeddingClient
 from ..search.tables import SearchArgs, search_tables
+from ..search.fuzzy3gram import reset_cache
 
 
 def _print_json(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2))
 
 
+# ---------------------------
+# DB admin
+# ---------------------------
+def _cmd_db_migrate(args: argparse.Namespace) -> None:
+    ensure_full_schema()
+    print("Database schema ensured (base + search).")
+
+
+def _cmd_db_stats(args: argparse.Namespace) -> None:
+    ensure_full_schema()
+    with sqlite_session() as conn:
+        counts = {}
+        def c(table: str) -> int:
+            try:
+                return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            except Exception:
+                return 0
+
+        counts["agregados"] = c("agregados")
+        counts["variables"] = c("variables")
+        counts["classifications"] = c("classifications")
+        counts["categories"] = c("categories")
+        counts["periods"] = c("periods")
+        counts["agregados_levels"] = c("agregados_levels")
+        counts["localities"] = c("localities")
+        counts["name_keys"] = c("name_keys")
+        counts["link_var"] = c("link_var")
+        counts["link_class"] = c("link_class")
+        counts["link_cat"] = c("link_cat")
+        counts["link_var_class"] = c("link_var_class")
+        counts["table_titles_fts"] = c("table_titles_fts")
+        try:
+            counts["embeddings_agregado"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM embeddings WHERE entity_type='agregado'"
+                ).fetchone()[0]
+            )
+        except Exception:
+            counts["embeddings_agregado"] = 0
+
+    _print_json(counts)
+
+
+# ---------------------------
+# Ingest
+# ---------------------------
 def _cmd_ingest(args: argparse.Namespace) -> None:
     ensure_full_schema()
     async def run():
@@ -458,25 +139,41 @@ def _cmd_ingest_coverage(args: argparse.Namespace) -> None:
     ensure_full_schema()
     report = asyncio.run(
         ingest_by_coverage(
-            require_any_levels=args.any_level,
-            require_all_levels=args.all_level,
-            exclude_levels=args.exclude_level,
+            coverage=args.coverage,
             subject_contains=args.subject_contains,
             survey_contains=args.survey_contains,
             limit=args.limit,
             concurrency=args.concurrent,
+            probe_concurrent=args.probe_concurrent,
         )
     )
     _print_json(asdict(report))
 
 
+# ---------------------------
+# Index / links
+# ---------------------------
+def _all_table_ids() -> list[int]:
+    with sqlite_session() as conn:
+        rows = conn.execute("SELECT id FROM agregados ORDER BY id").fetchall()
+        return [int(r[0]) for r in rows]
+
 def _cmd_build_links(args: argparse.Namespace) -> None:
     ensure_full_schema()
-    for tid in args.table_ids:
+    table_ids = _all_table_ids() if args.all else args.table_ids
+    if not table_ids:
+        print("No table IDs provided.")
+        return
+    for tid in table_ids:
         c = build_links_for_table(int(tid))
         print(f"{tid}: vars={c.vars} classes={c.classes} cats={c.cats} var×class={c.var_class}")
+    reset_cache()
+    print("fuzzy cache reset")
 
 
+# ---------------------------
+# Search
+# ---------------------------
 def _cmd_search_tables(args: argparse.Namespace) -> None:
     ensure_full_schema()
     sargs = SearchArgs(
@@ -521,34 +218,44 @@ def _cmd_search_tables(args: argparse.Namespace) -> None:
                 period = f" | {h.period_start or h.period_end}"
         cov = f" | N3={h.n3} N6={h.n6}" if (h.n3 or h.n6) else ""
         print(f"{h.table_id}: {h.title}{period}{cov}")
-        if h.why:
+        if args.explain and h.why:
             print("  matches:", " ".join(f"[{w}]" for w in h.why))
-        print(f"  score={h.score:.3f} (struct={h.struct_score:.3f}, rrf={h.rrf_score:.3f})")
+            print(f"  score={h.score:.3f} (struct={h.struct_score:.3f}, rrf={h.rrf_score:.3f})")
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sidra-search", description="Table-centric search & ingestion")
     sub = p.add_subparsers(dest="cmd")
 
+    # db
+    dbmig = sub.add_parser("db", help="Database utilities")
+    dbsub = dbmig.add_subparsers(dest="db_cmd")
+
+    db_migrate = dbsub.add_parser("migrate", help="Apply base + search schema")
+    db_migrate.set_defaults(func=_cmd_db_migrate)
+
+    db_stats = dbsub.add_parser("stats", help="Show row counts for key tables")
+    db_stats.set_defaults(func=_cmd_db_stats)
+
     # ingest single/many
     ig = sub.add_parser("ingest", help="Ingest one or more table IDs")
     ig.add_argument("table_ids", type=int, nargs="+")
     ig.set_defaults(func=_cmd_ingest)
 
-    # ingest by simple coverage discovery
+    # ingest by coverage discovery
     ic = sub.add_parser("ingest-coverage", help="Discover by coverage and ingest")
-    ic.add_argument("--any-level", dest="any_level", nargs="+")
-    ic.add_argument("--all-level", dest="all_level", nargs="+")
-    ic.add_argument("--exclude-level", dest="exclude_level", nargs="+")
-    ic.add_argument("--subject-contains")
-    ic.add_argument("--survey-contains")
+    ic.add_argument("--coverage", required=True, help='Boolean expr, e.g. "N3 OR (N6>=5000)"')
+    ic.add_argument("--subject-contains", dest="subject_contains", help="Filter catalog by subject name substring")
+    ic.add_argument("--survey-contains", dest="survey_contains", help="Filter catalog by survey name substring")
     ic.add_argument("--limit", type=int, default=None)
-    ic.add_argument("--concurrent", type=int, default=8)
+    ic.add_argument("--concurrent", type=int, default=8, help="ingestion concurrency")
+    ic.add_argument("--probe-concurrent", type=int, default=None, help="coverage probe concurrency (defaults to --concurrent)")
     ic.set_defaults(func=_cmd_ingest_coverage)
 
-    # build links explicitly (usually done automatically by ingest)
+    # build links
     bl = sub.add_parser("build-links", help="(Re)build link indexes for tables")
-    bl.add_argument("table_ids", type=int, nargs="+")
+    bl.add_argument("table_ids", type=int, nargs="*", help="Specific table IDs")
+    bl.add_argument("--all", action="store_true", help="Process all ingested tables")
     bl.set_defaults(func=_cmd_build_links)
 
     # search
@@ -559,9 +266,10 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--coverage", help="boolean coverage expr, e.g. '(N6>=5000) AND (N3>=27)'")
     st.add_argument("--limit", type=int, default=20)
     st.add_argument("--no-fuzzy", action="store_true")
-    st.add_argument("--var-th", type=float, default=0.90)
-    st.add_argument("--class-th", type=float, default=0.85)
+    st.add_argument("--var-th", type=float, default=0.80)
+    st.add_argument("--class-th", type=float, default=0.78)
     st.add_argument("--semantic", action="store_true", help="use semantic title ranking (requires embeddings)")
+    st.add_argument("--explain", action="store_true", help="print match rationale and scores")
     st.add_argument("--json", action="store_true")
     st.set_defaults(func=_cmd_search_tables)
 
@@ -571,11 +279,27 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
+
+    # Support nested: "db migrate"/"db stats"
+    if getattr(args, "cmd", None) == "db" and not hasattr(args, "func"):
+        parser.parse_args(["db", "-h"])
+        return
+
     if not hasattr(args, "func"):
         parser.print_help()
         return
     args.func(args)
 
+
+if __name__ == "__main__":
+    main()
+
+
+
+###############################################################################
+### FILE: cli/__main__.py
+###############################################################################
+from . import main
 
 if __name__ == "__main__":
     main()
@@ -882,12 +606,11 @@ DDL: tuple[str, ...] = (
       UNIQUE(var_key, class_key, table_id, variable_id, class_id)
     )
     """,
-    # FTS for titles
+    # FTS for titles (no extra index allowed on virtual table)
     """
     CREATE VIRTUAL TABLE IF NOT EXISTS table_titles_fts
     USING fts5(table_id UNINDEXED, title, survey, subject, tokenize='unicode61')
     """,
-    "CREATE INDEX IF NOT EXISTS idx_table_titles_fts_id ON table_titles_fts(table_id)",
     # Embeddings table (generic, reused for table titles)
     """
     CREATE TABLE IF NOT EXISTS embeddings (
@@ -902,7 +625,6 @@ DDL: tuple[str, ...] = (
       PRIMARY KEY (entity_type, entity_id, model)
     )
     """,
-    "CREATE INDEX IF NOT EXISTS idx_embeddings_agregado ON embeddings(agregado_id, model)",
 )
 
 INDEXES: tuple[str, ...] = (
@@ -910,6 +632,7 @@ INDEXES: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_link_class_key ON link_class(class_key)",
     "CREATE INDEX IF NOT EXISTS idx_link_cat_keys  ON link_cat(class_key, cat_key)",
     "CREATE INDEX IF NOT EXISTS idx_link_var_class ON link_var_class(var_key, class_key)",
+    "CREATE INDEX IF NOT EXISTS idx_embeddings_agregado ON embeddings(agregado_id, model)",
 )
 
 def apply_search_schema(connection) -> None:
@@ -1018,13 +741,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from ..net.api_client import SidraApiClient
 from ..db.session import sqlite_session, ensure_full_schema
 from .ingest_table import ingest_table
+from ..search.coverage import parse_coverage_expr, extract_levels, eval_coverage
 from ..config import get_settings
-
 
 @dataclass(frozen=True)
 class CatalogEntry:
@@ -1132,51 +855,176 @@ class BulkReport:
     ingested_ids: list[int] = field(default_factory=list)
     failed: list[tuple[int, str]] = field(default_factory=list)
 
+async def _probe_counts_for_levels(
+    client: SidraApiClient,
+    table_id: int,
+    levels: Iterable[str],
+) -> dict[str, int]:
+    """
+    Fetch locality lists per level for a table and return {LEVEL: count}.
+    Levels are normalized to UPPERCASE strings. Non-list responses count as 0.
+    """
+    counts: dict[str, int] = {}
+    for lvl in {str(l).upper() for l in levels if l}:
+        try:
+            payload = await client.fetch_localities(table_id, lvl)
+            if isinstance(payload, list):
+                counts[lvl] = len(payload)
+            else:
+                # defensive: sometimes API oddities; treat non-list as 0
+                counts[lvl] = 0
+        except Exception:
+            counts[lvl] = 0
+    return counts
+
 
 async def ingest_by_coverage(
-    *, require_any_levels: Iterable[str] | None = None,
-    require_all_levels: Iterable[str] | None = None,
-    exclude_levels: Iterable[str] | None = None,
+    *,
+    coverage: str,
     subject_contains: str | None = None,
     survey_contains: str | None = None,
     limit: int | None = None,
     concurrency: int = 8,
+    probe_concurrent: int | None = None,
 ) -> BulkReport:
+    """
+    Discover tables that satisfy the coverage expression and ingest them.
+
+    Fixes:
+      - Probes are bounded (no huge gather).
+      - Early-stop probing once we have enough matches.
+      - Per-table probe timeout.
+      - Progress ticks so it doesn't look frozen.
+    """
     ensure_full_schema()
     report = BulkReport()
+
+    # Parse coverage and extract hinted levels (e.g., {"N3","N6"})
+    try:
+        cov_ast = parse_coverage_expr(coverage)
+    except Exception as exc:
+        raise RuntimeError(f"Invalid --coverage expression: {coverage!r}: {exc}") from exc
+    level_hints = extract_levels(cov_ast)
+
+    # How many matches we actually need to keep
+    need = max(0, int(limit)) if (limit is not None and limit >= 0) else None
+    par_probe = max(1, int(probe_concurrent or concurrency))
+
     async with SidraApiClient() as client:
-        entries = await fetch_catalog_entries(
-            client=client, levels=[*(require_any_levels or ()), *(require_all_levels or ())]
-        )
+        # 1) Catalog fetch with hinted levels (cheap server-side pruning)
+        entries = await fetch_catalog_entries(client=client, levels=sorted(level_hints) or None)
+
+        # 2) Optional subject/survey narrowing (kept)
         entries = filter_catalog_entries(
             entries,
-            require_any_levels=require_any_levels,
-            require_all_levels=require_all_levels,
-            exclude_levels=exclude_levels,
+            require_any_levels=None,
+            require_all_levels=None,
+            exclude_levels=None,
             subject_contains=subject_contains,
             survey_contains=survey_contains,
         )
-        if limit is not None and limit >= 0:
-            entries = entries[:limit]
-        report.discovered_ids = [e.id for e in entries]
 
-        # skip already ingested (optional)
+        total = len(entries)
+        if total == 0:
+            return report
+
+        print(f"[probe] candidates={total}, levels={sorted(level_hints) or []}, parallel={par_probe}")
+
+        kept: list[CatalogEntry] = []
+        pending: set[asyncio.Task] = set()
+        it = iter(entries)
+
+        # Helper: schedule next probe task (skips tables that don't claim needed levels)
+        async def schedule_next() -> bool:
+            try:
+                e = next(it)
+            except StopIteration:
+                return False
+            check_levels = (level_hints & e.level_codes) if level_hints else set()
+            if not check_levels:
+                return True  # nothing to probe for this one; move on
+
+            async def _one(e_: CatalogEntry) -> tuple[CatalogEntry, bool]:
+                # Hard timeout per table to avoid indefinite stalls
+                per_table_timeout = max(10.0, 2.0 * float(get_settings().request_timeout))
+                try:
+                    counts = await asyncio.wait_for(
+                        _probe_counts_for_levels(client, e_.id, check_levels),
+                        timeout=per_table_timeout,
+                    )
+                    ok = eval_coverage(cov_ast, counts)
+                    return e_, ok
+                except Exception:
+                    return e_, False
+
+            t = asyncio.create_task(_one(e))
+            pending.add(t)
+            return True
+
+        # Prime the initial probe window
+        for _ in range(par_probe):
+            if not await schedule_next():
+                break
+
+        probed = 0
+        # Drain as tasks complete; keep backfilling to maintain parallelism; early stop when enough kept
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                probed += 1
+                e, ok = await t
+                if ok:
+                    kept.append(e)
+
+                # progress tick every 10 completes, or when we hit the target
+                if (probed % 10 == 0) or (need and len(kept) >= need):
+                    pct = (probed * 100) // max(1, total)
+                    print(f"\r[probe] probed={probed}/{total} kept={len(kept)} ({pct}%)", end="", flush=True)
+
+                if need and len(kept) >= need:
+                    pending.clear()
+                    break
+
+                while len(pending) < par_probe:
+                    more = await schedule_next()
+                    if not more:
+                        break
+
+        print()  # newline after progress
+
+        # 3) Cap to limit (if any) and record discovery
+        if need is not None:
+            kept = kept[:need]
+        report.discovered_ids = [e.id for e in kept]
+
+        # 4) Skip already ingested
         with sqlite_session() as conn:
             existing = {int(r[0]) for r in conn.execute("SELECT id FROM agregados")}
-        to_do = [e.id for e in entries if e.id not in existing]
+        to_do = [e.id for e in kept if e.id not in existing]
         report.scheduled_ids = list(to_do)
+        report.skipped_existing = [e.id for e in kept if e.id in existing]
 
+        if not to_do:
+            return report
+
+        # 5) Ingest concurrently (bounded)
+        print(f"[ingest] {len(to_do)} tables (parallel={concurrency})")
         sem = asyncio.Semaphore(max(1, concurrency))
+
         async def worker(tid: int) -> None:
             async with sem:
                 try:
                     await ingest_table(tid)
                     report.ingested_ids.append(tid)
+                    print(f"  ingested {tid}")
                 except Exception as exc:
                     report.failed.append((tid, str(exc)[:200]))
+                    print(f"  failed {tid}: {exc}")
 
         await asyncio.gather(*(worker(t) for t in to_do))
+
     return report
+
 
 
 
@@ -1200,10 +1048,14 @@ from ..db.base_schema import apply_base_schema
 from ..ingest.links import build_links_for_table
 from ..net.api_client import SidraApiClient
 from ..net.embedding_client import EmbeddingClient
-from ..search.normalize import normalize_basic
+from ..search.fuzzy3gram import reset_cache
 
 ISO = "%Y-%m-%dT%H:%M:%SZ"
 
+
+def _hash_fields(*vals: object) -> str:
+    # Robust: stringify, replace None with "", and hash a stable joined string
+    return _sha256_text("||".join("" if v is None else str(v) for v in vals))
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime(ISO)
@@ -1261,15 +1113,17 @@ def _canonical_table_text(md: dict[str, Any]) -> str:
                 level_parts.append(f"{level_type}: {', '.join(str(c) for c in codes)}")
 
     lines = [
-        f"Table {md.get('id')}: {str(md.get('nome') or '').strip()}".strip(),
-        f"Survey: {md.get('pesquisa')}" if md.get("pesquisa") else None,
-        f"Subject: {md.get('assunto')}" if md.get("assunto") else None,
-        f"Frequency: {freq}" if freq else None,
+        f"Table {str(md.get('id'))}: {str(md.get('nome') or '').strip()}".strip(),
+        f"Survey: {str(md.get('pesquisa') or '')}" if md.get("pesquisa") else None,
+        f"Subject: {str(md.get('assunto') or '')}" if md.get("assunto") else None,
+        f"Frequency: {str(freq)}" if freq else None,
         period_line,
         f"Territorial levels: {'; '.join(level_parts)}" if level_parts else None,
-        f"URL: {md.get('URL')}" if md.get("URL") else None,
+        f"URL: {str(md.get('URL') or '')}" if md.get("URL") else None,
     ]
-    return "\n".join(l for l in lines if l)
+    # every yielded piece is a str; ignore falsy items
+    return "\n".join([s for s in lines if isinstance(s, str) and s])
+
 
 
 def _vec_to_blob(vec: Sequence[float]) -> bytes:
@@ -1417,7 +1271,7 @@ async def ingest_table(
                     v.get("nome"),
                     v.get("unidade"),
                     _json_text(v.get("sumarizacao", [])),
-                    _sha256_text("||".join([str(v.get("id")), v.get("nome", ""), v.get("unidade", "")])),
+                    _hash_fields(v.get("id"), v.get("nome"), v.get("unidade")),   # <— here
                 )
             )
 
@@ -1444,7 +1298,7 @@ async def ingest_table(
                         cat.get("nome"),
                         cat.get("unidade"),
                         cat.get("nivel"),
-                        _sha256_text("||".join([str(cid), str(cat.get("id")), cat.get("nome",""), cat.get("unidade","")])),
+                        _hash_fields(cid, cat.get("id"), cat.get("nome"), cat.get("unidade")),  # <— here
                     )
                 )
 
@@ -1580,12 +1434,18 @@ async def ingest_table(
         # build name→table link indexes
         if build_links:
             await asyncio.to_thread(build_links_for_table, table_id)
+            # make new names visible to in-process searches
+            reset_cache()  # ADD
 
         # optional embeddings for title text
         if get_settings().enable_title_embeddings:
-            embedding_client = embedding_client or EmbeddingClient()
-            text = _canonical_table_text(md)
-            await _ensure_embeddings(table_id, text, embedding_client=embedding_client)
+            try:
+                embedding_client = embedding_client or EmbeddingClient()
+                text = _canonical_table_text(md)
+                await _ensure_embeddings(table_id, text, embedding_client=embedding_client)
+            except Exception:
+                # don't break ingestion if embeddings fail
+                pass
 
     finally:
         if own_client:
@@ -1749,10 +1609,17 @@ class SidraApiError(RuntimeError):
 class SidraApiClient:
     def __init__(self, *, base_url: str | None = None, timeout: float | None = None) -> None:
         s = get_settings()
+        # Explicit timeouts so slow servers can't stall forever on read/close
+        t = float(timeout or s.request_timeout)
+        http_timeout = httpx.Timeout(connect=t, read=t, write=t, pool=t)
+        # Keep connections bounded (Windows sockets behave better this way)
+        limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
+
         self._client = httpx.AsyncClient(
             base_url=base_url or s.sidra_base_url,
-            timeout=timeout or s.request_timeout,
+            timeout=http_timeout,
             headers={"User-Agent": s.user_agent},
+            limits=limits,
         )
 
     async def __aenter__(self) -> Self: return self
@@ -1923,8 +1790,12 @@ class _Parser:
         return self._cmp()
     def _cmp(self) -> Any:
         ident = self._eat('ID').value
+        # Allow bare identifiers like "N3" (shorthand for "N3 >= 1")
+        if self.cur.kind != 'OP':
+            return _Cmp('>=', ident, 1)
         op = self._eat('OP').value
-        if op == '=': op = '=='
+        if op == '=':
+            op = '=='
         number = int(self._eat('NUM').value)
         return _Cmp(op, ident, number)
 
@@ -1937,7 +1808,7 @@ def extract_levels(node: Any) -> set[str]:
         elif isinstance(n, _Not): _w(n.node)
         elif isinstance(n, (_And,_Or)): _w(n.left); _w(n.right)
     _w(node)
-    return out
+    return out      
 
 def eval_coverage(node: Any, counts: dict[str,int]) -> bool:
     def _cmp(op: str, a: int, b: int) -> bool:
@@ -1955,82 +1826,113 @@ def eval_coverage(node: Any, counts: dict[str,int]) -> bool:
 ###############################################################################
 ### FILE: search/fuzzy3gram.py
 ###############################################################################
+# src/sidra_search/search/fuzzy3gram.py
 from __future__ import annotations
 
-from collections import Counter
-from math import sqrt, log
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Literal
+
+from rapidfuzz import fuzz, process
 
 from ..db.session import create_connection
 from ..db.migrations import apply_search_schema
 from .normalize import normalize_basic
 
-_CORPUS: Dict[str, Dict[str, Counter]] = {"var": {}, "class": {}}
-_IDF: Dict[str, Dict[str, float]] = {"var": {}, "class": {}}
+# In-RAM corpus of normalized names by kind
+# kind: "var" or "class"
+_CORPUS: Dict[str, List[str]] = {"var": [], "class": []}
 _BUILT = False
 
+
 def reset_cache() -> None:
+    """Clear the in-RAM corpus so new names become visible in the same process."""
     global _BUILT
     _BUILT = False
     _CORPUS["var"].clear()
     _CORPUS["class"].clear()
-    _IDF["var"].clear()
-    _IDF["class"].clear()
 
-def _trigrams(s: str) -> Counter:
-    s = f"  {s}  "
-    return Counter(s[i:i+3] for i in range(len(s)-2))
 
 def _build() -> None:
+    """Build the list of normalized names for variables and classifications."""
     global _BUILT
-    if _BUILT: return
+    if _BUILT:
+        return
     conn = create_connection()
     try:
         apply_search_schema(conn)
+        # Pull *normalized* names from DB and unique them
         var_keys = [normalize_basic(r[0]) for r in conn.execute("SELECT DISTINCT nome FROM variables")]
         class_keys = [normalize_basic(r[0]) for r in conn.execute("SELECT DISTINCT nome FROM classifications")]
-        for kind, keys in (("var", var_keys), ("class", class_keys)):
-            keys = [k for k in keys if k]
-            docs: Dict[str, Counter] = {}
-            df: Counter = Counter()
-            for key in keys:
-                grams = _trigrams(key)
-                docs[key] = grams
-                for g in grams.keys():
-                    df[g] += 1
-            N = max(1, len(keys))
-            _CORPUS[kind] = docs
-            _IDF[kind] = {g: log((N + 1) / (dfg + 1)) + 1.0 for g, dfg in df.items()}
+
+        _CORPUS["var"] = sorted({k for k in var_keys if k})
+        _CORPUS["class"] = sorted({k for k in class_keys if k})
         _BUILT = True
     finally:
         conn.close()
 
-def _vec(kind: str, text: str) -> Dict[str, float]:
-    grams = _trigrams(text)
-    idf = _IDF[kind]
-    return {g: tf * idf.get(g, 1.0) for g, tf in grams.items()}
 
-def _cos(a: Dict[str, float], b: Dict[str, float]) -> float:
-    if not a or not b: return 0.0
-    dot = sum(va * b.get(k, 0.0) for k, va in a.items())
-    na = sqrt(sum(v*v for v in a.values()))
-    nb = sqrt(sum(v*v for v in b.values()))
-    if na == 0.0 or nb == 0.0: return 0.0
-    return dot / (na * nb)
+def _rf_score(a: str, b: str) -> float:
+    """
+    Blend a few RapidFuzz scorers (all 0..100) to cover:
+      - substrings (partial_ratio),
+      - bag-of-words overlap (token_set_ratio),
+      - general fuzz (WRatio).
+    """
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 100.0
+    s2 = fuzz.token_set_ratio(a, b)   # multi-token overlap, order-insensitive
+    s1 = fuzz.partial_ratio(a, b)     # substring-ish
+    s3 = fuzz.WRatio(a, b)            # robust overall
+    return 0.5 * s2 + 0.3 * s1 + 0.2 * s3
 
-def similar_keys(kind: str, query_raw: str, *, threshold: float, top_k: int = 10) -> List[Tuple[str, float]]:
+
+def similar_keys(
+    kind: Literal["var", "class"],
+    query_raw: str,
+    *,
+    threshold: float,
+    top_k: int = 10,
+) -> List[Tuple[str, float]]:
+    """
+    Return [(normalized_key, score in 0..1)] of the best matches for the given kind.
+    """
     assert kind in ("var", "class")
     _build()
+
     q = normalize_basic(query_raw)
-    if not q: return []
-    qv = _vec(kind, q)
-    out: List[Tuple[str, float]] = []
-    for key, grams in _CORPUS[kind].items():
-        sv = {g: tf * _IDF[kind].get(g, 1.0) for g, tf in grams.items()}
-        s = _cos(qv, sv)
-        if s >= threshold:
-            out.append((key, s))
-    out.sort(key=lambda x: x[1], reverse=True)
+    if not q:
+        return []
+
+    choices = _CORPUS[kind]
+    if not choices:
+        return []
+
+    # Use RapidFuzz's indexer for speed and quality, with our blended scorer.
+    # We over-fetch (×5) then cut to top_k after filtering by threshold.
+    results = process.extract(
+        q,
+        choices,
+        scorer=_rf_score,
+        limit=max(10, top_k * 5),
+        score_cutoff=max(0.0, min(100.0, threshold * 100.0)),
+    )
+
+    out: List[Tuple[str, float]] = [(key, float(score) / 100.0) for (key, score, _idx) in results]
+
+    # Safe fallback: if nothing matched (e.g., extremely short queries with strict threshold),
+    # return simple substring-contains candidates ranked by relative length.
+    if not out:
+        rel = []
+        for key in choices:
+            if q in key:
+                # Favor tighter matches
+                rel_score = len(q) / max(1, len(key))
+                rel.append((key, rel_score))
+        rel.sort(key=lambda x: x[1], reverse=True)
+        out = rel[:top_k]
+
+    # Final cut to top_k
     return out[:top_k]
 
 
@@ -2038,24 +1940,460 @@ def similar_keys(kind: str, query_raw: str, *, threshold: float, top_k: int = 10
 ###############################################################################
 ### FILE: search/normalize.py
 ###############################################################################
+# src/sidra_search/search/normalize.py
 from __future__ import annotations
 
 import re
 import unicodedata
 
 _WS = re.compile(r"\s+")
-_PUNCT = re.compile(r"[^\w\s]", re.UNICODE)  # keep letters/digits/underscore
+# Keep hyphen as a token-forming char per plan; drop other punctuation.
+_PUNCT = re.compile(r"[^\w\s-]", re.UNICODE)
 
 def normalize_basic(s: str | None) -> str:
-    if not s: return ""
+    if not s:
+        return ""
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = s.lower()
-    s = s.replace("\u00A0", " ")
+    s = s.lower().replace("\u00a0", " ")
+    # normalize whitespace around hyphens
     s = _WS.sub(" ", s).strip()
     s = _PUNCT.sub(" ", s)
     s = _WS.sub(" ", s).strip()
+    # collapse repeated hyphens/spaces like " -  - "
+    s = re.sub(r"\s*-\s*", "-", s)
+    s = _WS.sub(" ", s).strip()
     return s
+
+
+
+###############################################################################
+### FILE: search/tables.py
+###############################################################################
+# src/sidra_search/search/tables.py
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+from ..db.session import create_connection
+from ..db.migrations import apply_search_schema
+from ..search.normalize import normalize_basic
+from ..search.coverage import parse_coverage_expr, extract_levels, eval_coverage
+from ..search.fuzzy3gram import similar_keys
+from ..search.title_rank import rrf
+from ..net.embedding_client import EmbeddingClient
+from ..config import get_settings
+
+
+@dataclass(frozen=True)
+class TableHit:
+    table_id: int
+    title: str
+    period_start: str | None
+    period_end: str | None
+    n3: int
+    n6: int
+    why: List[str]
+    score: float
+    rrf_score: float
+    struct_score: float
+
+
+@dataclass(frozen=True)
+class SearchArgs:
+    title: str | None
+    vars: Tuple[str, ...]
+    classes: Tuple[str, ...]   # "Class" or "Class:Category"
+    coverage: str | None
+    limit: int
+    allow_fuzzy: bool
+    var_th: float
+    class_th: float
+    semantic: bool    # use embeddings for titles
+
+
+def _split_class(spec: str) -> Tuple[str, Optional[str]]:
+    if ":" in spec:
+        a, b = spec.split(":", 1)
+        return a.strip(), b.strip()
+    return spec.strip(), None
+
+
+def _fts_query(text: str) -> str:
+    toks = [t for t in normalize_basic(text).split() if t]
+    return " ".join(toks)
+
+
+def _union_tables_for_keys(conn, table: str, col: str, keys: Iterable[str]) -> Set[int]:
+    ids: Set[int] = set()
+    keys = [k for k in set(keys) if k]
+    if not keys:
+        return ids
+    for key in keys:
+        rows = conn.execute(f"SELECT DISTINCT table_id FROM {table} WHERE {col} = ?", (key,)).fetchall()
+        ids |= {int(r[0]) for r in rows}
+    return ids
+
+
+def _intersect_groups_union_inside(conn, table: str, col: str, groups: List[Set[str]]) -> Set[int]:
+    """
+    For classes-only queries: for each group (expansions for a requested class),
+    take the union of tables, then intersect across groups.
+    """
+    result: Optional[Set[int]] = None
+    for g in groups:
+        u = _union_tables_for_keys(conn, table, col, g)
+        result = u if result is None else (result & u)
+        if not result:
+            return set()
+    return result or set()
+
+
+def _tables_for_class_cat_multi(conn, groups_and_cat: List[Tuple[Set[str], str]]) -> Set[int]:
+    """
+    Intersect across pairs. For each pair, we accept any class_key from the group's expansions,
+    but the category_key is strict (per plan).
+    """
+    result: Optional[Set[int]] = None
+    for class_keys, cat_key in groups_and_cat:
+        if not class_keys or not cat_key:
+            return set()
+        u: Set[int] = set()
+        for ck in class_keys:
+            rows = conn.execute(
+                "SELECT DISTINCT table_id FROM link_cat WHERE class_key=? AND cat_key=?",
+                (ck, cat_key),
+            ).fetchall()
+            u |= {int(r[0]) for r in rows}
+        result = u if result is None else (result & u)
+        if not result:
+            return set()
+    return result or set()
+
+
+def _select_in(conn, sql_prefix: str, items: Sequence[str], *prefix_params) -> List[tuple]:
+    """
+    Helper to run `sql_prefix ... IN (?)` safely with dynamic placeholders.
+    Returns rows as tuples.
+    """
+    if not items:
+        return []
+    placeholders = ",".join("?" for _ in items)
+    sql = f"{sql_prefix} ({placeholders})"
+    cur = conn.execute(sql, (*prefix_params, *items))
+    return [tuple(r) for r in cur.fetchall()]
+
+
+async def search_tables(
+    args: SearchArgs,
+    *,
+    embedding_client: EmbeddingClient | None = None,
+) -> List[TableHit]:
+    conn = create_connection()
+    try:
+        apply_search_schema(conn)
+
+        # ---------- Expand inputs (with scores) ----------
+        # Vars
+        var_cand_score: Dict[str, float] = {}
+        var_exact: Set[str] = set()
+        for v in args.vars or ():
+            ek = normalize_basic(v)
+            if ek:
+                var_cand_score[ek] = max(var_cand_score.get(ek, 0.0), 1.0)  # exact=1.0
+                var_exact.add(ek)
+            if args.allow_fuzzy:
+                for k, s in similar_keys("var", v, threshold=args.var_th, top_k=12):
+                    var_cand_score[k] = max(var_cand_score.get(k, 0.0), float(s))
+
+        # Classes (grouped by request)
+        class_groups: List[Dict[str, float]] = []  # one dict per requested class
+        class_exact: List[str] = []                # exact key per group (may be "")
+        class_cat_per_group: List[Optional[str]] = []  # strict category (normalized) or None
+        for spec in args.classes or ():
+            raw_class, raw_cat = _split_class(spec)
+            ck_exact = normalize_basic(raw_class)
+            catk = normalize_basic(raw_cat) if raw_cat else None
+
+            group: Dict[str, float] = {}
+            if ck_exact:
+                group[ck_exact] = 1.0
+            if args.allow_fuzzy and raw_class:
+                for k, s in similar_keys("class", raw_class, threshold=args.class_th, top_k=12):
+                    group[k] = max(group.get(k, 0.0), float(s))
+
+            class_groups.append(group)
+            class_exact.append(ck_exact or "")
+            class_cat_per_group.append(catk)
+
+        # ---------- Initial candidate tables ----------
+        candidates: Optional[Set[int]] = None
+
+        # If there are var candidates: union of tables with any var candidate
+        if var_cand_score:
+            ids = _union_tables_for_keys(conn, "link_var", "var_key", var_cand_score.keys())
+            candidates = ids if candidates is None else (candidates & ids)
+
+        # If classes-only: intersect across groups (union inside)
+        if not var_cand_score and class_groups:
+            groups_sets = [set(g) for g in class_groups]
+            ids = _intersect_groups_union_inside(conn, "link_class", "class_key", groups_sets)
+            candidates = ids if candidates is None else (candidates & ids)
+
+        # Class:Category constraints (class fuzzy, category strict)
+        class_cat_groups = [
+            (set(class_groups[i].keys()), catk) for i, catk in enumerate(class_cat_per_group) if catk
+        ]
+        if class_cat_groups:
+            ids = _tables_for_class_cat_multi(conn, class_cat_groups)
+            candidates = ids if candidates is None else (candidates & ids)
+
+        # If nothing structural given: all tables
+        if candidates is None:
+            rows = conn.execute("SELECT id FROM agregados").fetchall()
+            candidates = {int(r[0]) for r in rows}
+
+        if not candidates:
+            return []
+
+        # ---------- Coverage filter (post-structural) ----------
+        if args.coverage:
+            try:
+                ast = parse_coverage_expr(args.coverage)
+            except Exception:
+                ast = None
+            if ast:
+                needed = extract_levels(ast)
+                keep: Set[int] = set()
+                for tid in candidates:
+                    rows = conn.execute(
+                        "SELECT level_id, locality_count FROM agregados_levels WHERE agregado_id=?",
+                        (tid,),
+                    ).fetchall()
+                    counts = {str(r["level_id"]).upper(): int(r["locality_count"] or 0) for r in rows}
+                    if eval_coverage(ast, counts):
+                        keep.add(tid)
+                candidates = keep
+                if not candidates:
+                    return []
+
+        # ---------- Title ranking (lexical + semantic) ----------
+        lexical_ranks: Dict[int, int] = {}
+        semantic_ranks: Dict[int, int] = {}
+
+        if args.title and get_settings().enable_titles_fts:
+            q = _fts_query(args.title)
+            if q:
+                rows = conn.execute(
+                    "SELECT table_id FROM table_titles_fts WHERE table_titles_fts MATCH ?",
+                    (q,),
+                ).fetchall()
+                order: List[int] = []
+                seen: Set[int] = set()
+                for r in rows:
+                    t = int(r[0])
+                    if t in candidates and t not in seen:
+                        seen.add(t); order.append(t)
+                    if len(order) >= args.limit * 5:
+                        break
+                lexical_ranks = {tid: idx + 1 for idx, tid in enumerate(order)}
+
+        if args.title and args.semantic and get_settings().enable_title_embeddings:
+            emb = embedding_client or EmbeddingClient()
+            try:
+                # keyword-only parameter "model", so call with a lambda/partial
+                qvec = await asyncio.to_thread(lambda: emb.embed_text(args.title, model=emb.model))
+            except Exception:
+                qvec = None
+
+            if qvec:
+                ordered = sorted(candidates)
+                placeholders = ",".join("?" for _ in ordered)
+                sql = (
+                    f"SELECT entity_id, dimension, vector "
+                    f"FROM embeddings WHERE entity_type='agregado' AND model=? AND entity_id IN ({placeholders})"
+                )
+                cur = conn.execute(sql, (emb.model, *ordered))
+
+                from array import array
+                import math
+
+                def to_vec(blob, dim):
+                    arr = array("f"); arr.frombytes(blob); v = list(arr)
+                    return v[:dim] if dim and len(v) > dim else v
+
+                def cosine(a: Sequence[float], b: Sequence[float]) -> float:
+                    if not a or not b or len(a) != len(b): return 0.0
+                    dot = sum(x*y for x,y in zip(a,b))
+                    na = math.sqrt(sum(x*x for x in a))
+                    nb = math.sqrt(sum(x*x for x in b))
+                    return 0.0 if na==0 or nb==0 else dot/(na*nb)
+
+                sims: List[Tuple[int, float]] = []
+                for row in cur.fetchall():
+                    tid = int(row["entity_id"])
+                    vec = to_vec(row["vector"], int(row["dimension"]))
+                    sim = cosine(qvec, vec)
+                    if sim > 0:
+                        sims.append((tid, sim))
+                sims.sort(key=lambda x: x[1], reverse=True)
+                top = [tid for (tid, _s) in sims[: args.limit * 5]]
+                semantic_ranks = {tid: idx + 1 for idx, tid in enumerate(top)}
+
+
+        rrf_scores = rrf({**lexical_ranks, **semantic_ranks}, k=60.0)
+
+        # ---------- Structural scoring with fuzzy pairing ----------
+        # Pre-materialize for speed per table:
+        var_candidates = list(var_cand_score.keys())
+        class_groups_list = [list(g.keys()) for g in class_groups]
+
+        def struct_for_table(tid: int) -> Tuple[float, List[str]]:
+            why: List[str] = []
+
+            # Quickly list var keys present in this table among our candidates
+            present_vars = set(k for (k, ) in _select_in(
+                conn,
+                "SELECT var_key FROM link_var WHERE table_id=? AND var_key IN",
+                var_candidates, tid
+            ))
+
+            # If query has var(s), require at least one present; else classes-only path
+            if var_candidates and not present_vars:
+                return 0.0, []
+
+            # If classes-only, we don't need pairing against a var
+            if not var_candidates and class_groups:
+                score_cls = 0.0
+                for gi, grp in enumerate(class_groups):
+                    present_any = set(k for (k, ) in _select_in(
+                        conn,
+                        "SELECT class_key FROM link_class WHERE table_id=? AND class_key IN",
+                        class_groups_list[gi], tid
+                    ))
+                    if not present_any:
+                        return 0.0, []
+                    # take best cosine in this group
+                    best_ck = max(present_any, key=lambda k: class_groups[gi].get(k, 0.0))
+                    score_cls += class_groups[gi].get(best_ck, 0.0)
+                    exact = class_exact[gi]
+                    if best_ck == exact and exact:
+                        why.append(f'class="{best_ck}"')
+                    else:
+                        why.append(f'class≈"{best_ck}"')
+                s_classes = (score_cls / max(1, len(class_groups)))
+                return (0.35 * s_classes, why)  # small structure score without a var
+
+            # With var(s): choose the BEST variable that satisfies all class groups
+            best_struct = 0.0
+            best_why: List[str] = []
+
+            for vk in present_vars or set(["__no_var__"]):
+                if vk == "__no_var__":  # defensive
+                    continue
+
+                # For each class group, find the best class_key that:
+                #  - pairs with this var (link_var_class)
+                #  - and (if that group has a category) has link_cat(class_key, cat_key)
+                cls_picks: List[Tuple[str, float, bool]] = []  # (ck, score, is_exact)
+                ok_all = True
+                for gi, grp in enumerate(class_groups):
+                    if not grp:
+                        continue
+                    group_keys = list(grp.keys())
+
+                    # category constraint (strict) narrows allowed class keys
+                    if class_cat_per_group[gi]:
+                        allowed = set(k for (k, ) in _select_in(
+                            conn,
+                            "SELECT class_key FROM link_cat WHERE table_id=? AND cat_key=? AND class_key IN",
+                            group_keys, tid, class_cat_per_group[gi]
+                        ))
+                    else:
+                        allowed = set(group_keys)
+
+                    if not allowed:
+                        ok_all = False; break
+
+                    # pairing constraint: only class_keys that pair with this var in this table
+                    paired = set(k for (k, ) in _select_in(
+                        conn,
+                        "SELECT class_key FROM link_var_class WHERE table_id=? AND var_key=? AND class_key IN",
+                        list(allowed), tid, vk
+                    ))
+                    if not paired:
+                        ok_all = False; break
+
+                    # pick the best scoring class key in this group
+                    best_ck = max(paired, key=lambda k: grp.get(k, 0.0))
+                    cls_picks.append((best_ck, grp.get(best_ck, 0.0), best_ck == class_exact[gi]))
+
+                if not ok_all:
+                    continue
+
+                s_var = var_cand_score.get(vk, 0.0)
+                s_classes = (sum(s for (_ck, s, _ex) in cls_picks) / max(1, len(cls_picks))) if cls_picks else 0.0
+                exact_boost = (0.10 if vk in var_exact else 0.0) + 0.05 * sum(1 for (_ck, _s, ex) in cls_picks if ex)
+                struct = 0.55 * s_var + 0.35 * s_classes + exact_boost
+
+                # Build WHY for this candidate
+                why_vk = [f'var{"=" if vk in var_exact else "≈"}"{vk}"']
+                for ck, _s, ex in cls_picks:
+                    why_vk.append(f'class{"=" if ex else "≈"}"{ck}"')
+                if cls_picks:
+                    why_vk.append("var×class")
+
+                if struct > best_struct:
+                    best_struct, best_why = struct, why_vk
+
+            return best_struct, best_why
+
+        # ---------- Assemble hits ----------
+        hits: List[TableHit] = []
+        for tid in candidates:
+            row = conn.execute(
+                "SELECT id, nome, periodo_inicio, periodo_fim FROM agregados WHERE id=?",
+                (tid,),
+            ).fetchone()
+            if not row:
+                continue
+
+            n3r = conn.execute(
+                "SELECT COALESCE(locality_count,0) FROM agregados_levels WHERE agregado_id=? AND level_id='N3'",
+                (tid,),
+            ).fetchone()
+            n6r = conn.execute(
+                "SELECT COALESCE(locality_count,0) FROM agregados_levels WHERE agregado_id=? AND level_id='N6'",
+                (tid,),
+            ).fetchone()
+            n3 = int(n3r[0]) if n3r else 0
+            n6 = int(n6r[0]) if n6r else 0
+
+            struct, why = struct_for_table(tid)
+            rrf_score = float(rrf_scores.get(tid, 0.0))
+            final = 0.75 * struct + 0.25 * rrf_score  # per plan
+
+            hits.append(
+                TableHit(
+                    table_id=int(row["id"]),
+                    title=str(row["nome"] or ""),
+                    period_start=row["periodo_inicio"],
+                    period_end=row["periodo_fim"],
+                    n3=n3,
+                    n6=n6,
+                    why=why,
+                    score=final,
+                    rrf_score=rrf_score,
+                    struct_score=struct,
+                )
+            )
+
+        hits.sort(key=lambda h: h.score, reverse=True)
+        return hits[: max(1, int(args.limit))]
+    finally:
+        conn.close()
 
 
 

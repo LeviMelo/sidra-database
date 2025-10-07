@@ -17,10 +17,17 @@ class SidraApiError(RuntimeError):
 class SidraApiClient:
     def __init__(self, *, base_url: str | None = None, timeout: float | None = None) -> None:
         s = get_settings()
+        # Explicit timeouts so slow servers can't stall forever on read/close
+        t = float(timeout or s.request_timeout)
+        http_timeout = httpx.Timeout(connect=t, read=t, write=t, pool=t)
+        # Keep connections bounded (Windows sockets behave better this way)
+        limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
+
         self._client = httpx.AsyncClient(
             base_url=base_url or s.sidra_base_url,
-            timeout=timeout or s.request_timeout,
+            timeout=http_timeout,
             headers={"User-Agent": s.user_agent},
+            limits=limits,
         )
 
     async def __aenter__(self) -> Self: return self

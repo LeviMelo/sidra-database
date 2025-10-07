@@ -12,6 +12,7 @@ from ..ingest.bulk import ingest_by_coverage
 from ..ingest.links import build_links_for_table
 from ..net.embedding_client import EmbeddingClient
 from ..search.tables import SearchArgs, search_tables
+from ..search.fuzzy3gram import reset_cache
 
 
 def _print_json(obj) -> None:
@@ -80,13 +81,12 @@ def _cmd_ingest_coverage(args: argparse.Namespace) -> None:
     ensure_full_schema()
     report = asyncio.run(
         ingest_by_coverage(
-            require_any_levels=args.any_level,
-            require_all_levels=args.all_level,
-            exclude_levels=args.exclude_level,
+            coverage=args.coverage,
             subject_contains=args.subject_contains,
             survey_contains=args.survey_contains,
             limit=args.limit,
             concurrency=args.concurrent,
+            probe_concurrent=args.probe_concurrent,
         )
     )
     _print_json(asdict(report))
@@ -109,6 +109,8 @@ def _cmd_build_links(args: argparse.Namespace) -> None:
     for tid in table_ids:
         c = build_links_for_table(int(tid))
         print(f"{tid}: vars={c.vars} classes={c.classes} cats={c.cats} var×class={c.var_class}")
+    reset_cache()
+    print("fuzzy cache reset")
 
 
 # ---------------------------
@@ -182,15 +184,14 @@ def build_parser() -> argparse.ArgumentParser:
     ig.add_argument("table_ids", type=int, nargs="+")
     ig.set_defaults(func=_cmd_ingest)
 
-    # ingest by simple coverage discovery
+    # ingest by coverage discovery
     ic = sub.add_parser("ingest-coverage", help="Discover by coverage and ingest")
-    ic.add_argument("--any-level", dest="any_level", nargs="+")
-    ic.add_argument("--all-level", dest="all_level", nargs="+")
-    ic.add_argument("--exclude-level", dest="exclude_level", nargs="+")
-    ic.add_argument("--subject-contains")
-    ic.add_argument("--survey-contains")
+    ic.add_argument("--coverage", required=True, help='Boolean expr, e.g. "N3 OR (N6>=5000)"')
+    ic.add_argument("--subject-contains", dest="subject_contains", help="Filter catalog by subject name substring")
+    ic.add_argument("--survey-contains", dest="survey_contains", help="Filter catalog by survey name substring")
     ic.add_argument("--limit", type=int, default=None)
-    ic.add_argument("--concurrent", type=int, default=8)
+    ic.add_argument("--concurrent", type=int, default=8, help="ingestion concurrency")
+    ic.add_argument("--probe-concurrent", type=int, default=None, help="coverage probe concurrency (defaults to --concurrent)")
     ic.set_defaults(func=_cmd_ingest_coverage)
 
     # build links
@@ -207,8 +208,8 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--coverage", help="boolean coverage expr, e.g. '(N6>=5000) AND (N3>=27)'")
     st.add_argument("--limit", type=int, default=20)
     st.add_argument("--no-fuzzy", action="store_true")
-    st.add_argument("--var-th", type=float, default=0.90)
-    st.add_argument("--class-th", type=float, default=0.85)
+    st.add_argument("--var-th", type=float, default=0.80)
+    st.add_argument("--class-th", type=float, default=0.78)
     st.add_argument("--semantic", action="store_true", help="use semantic title ranking (requires embeddings)")
     st.add_argument("--explain", action="store_true", help="print match rationale and scores")
     st.add_argument("--json", action="store_true")

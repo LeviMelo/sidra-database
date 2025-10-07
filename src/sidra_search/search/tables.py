@@ -230,39 +230,46 @@ async def search_tables(
 
         if args.title and args.semantic and get_settings().enable_title_embeddings:
             emb = embedding_client or EmbeddingClient()
-            qvec = await asyncio.to_thread(emb.embed_text, args.title, emb.model)
-            ordered = sorted(candidates)
-            placeholders = ",".join("?" for _ in ordered)
-            sql = (
-                f"SELECT entity_id, dimension, vector "
-                f"FROM embeddings WHERE entity_type='agregado' AND model=? AND entity_id IN ({placeholders})"
-            )
-            cur = conn.execute(sql, (emb.model, *ordered))
+            try:
+                # keyword-only parameter "model", so call with a lambda/partial
+                qvec = await asyncio.to_thread(lambda: emb.embed_text(args.title, model=emb.model))
+            except Exception:
+                qvec = None
 
-            from array import array
-            import math
+            if qvec:
+                ordered = sorted(candidates)
+                placeholders = ",".join("?" for _ in ordered)
+                sql = (
+                    f"SELECT entity_id, dimension, vector "
+                    f"FROM embeddings WHERE entity_type='agregado' AND model=? AND entity_id IN ({placeholders})"
+                )
+                cur = conn.execute(sql, (emb.model, *ordered))
 
-            def to_vec(blob, dim):
-                arr = array("f"); arr.frombytes(blob); v = list(arr)
-                return v[:dim] if dim and len(v) > dim else v
+                from array import array
+                import math
 
-            def cosine(a: Sequence[float], b: Sequence[float]) -> float:
-                if not a or not b or len(a) != len(b): return 0.0
-                dot = sum(x*y for x,y in zip(a,b))
-                na = math.sqrt(sum(x*x for x in a))
-                nb = math.sqrt(sum(x*x for x in b))
-                return 0.0 if na==0 or nb==0 else dot/(na*nb)
+                def to_vec(blob, dim):
+                    arr = array("f"); arr.frombytes(blob); v = list(arr)
+                    return v[:dim] if dim and len(v) > dim else v
 
-            sims: List[Tuple[int, float]] = []
-            for row in cur.fetchall():
-                tid = int(row["entity_id"])
-                vec = to_vec(row["vector"], int(row["dimension"]))
-                sim = cosine(qvec, vec)
-                if sim > 0:
-                    sims.append((tid, sim))
-            sims.sort(key=lambda x: x[1], reverse=True)
-            top = [tid for (tid, _s) in sims[: args.limit * 5]]
-            semantic_ranks = {tid: idx + 1 for idx, tid in enumerate(top)}
+                def cosine(a: Sequence[float], b: Sequence[float]) -> float:
+                    if not a or not b or len(a) != len(b): return 0.0
+                    dot = sum(x*y for x,y in zip(a,b))
+                    na = math.sqrt(sum(x*x for x in a))
+                    nb = math.sqrt(sum(x*x for x in b))
+                    return 0.0 if na==0 or nb==0 else dot/(na*nb)
+
+                sims: List[Tuple[int, float]] = []
+                for row in cur.fetchall():
+                    tid = int(row["entity_id"])
+                    vec = to_vec(row["vector"], int(row["dimension"]))
+                    sim = cosine(qvec, vec)
+                    if sim > 0:
+                        sims.append((tid, sim))
+                sims.sort(key=lambda x: x[1], reverse=True)
+                top = [tid for (tid, _s) in sims[: args.limit * 5]]
+                semantic_ranks = {tid: idx + 1 for idx, tid in enumerate(top)}
+
 
         rrf_scores = rrf({**lexical_ranks, **semantic_ranks}, k=60.0)
 
