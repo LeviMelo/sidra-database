@@ -53,12 +53,11 @@ DDL: tuple[str, ...] = (
       UNIQUE(var_key, class_key, table_id, variable_id, class_id)
     )
     """,
-    # FTS for titles
+    # FTS for titles (no extra index allowed on virtual table)
     """
     CREATE VIRTUAL TABLE IF NOT EXISTS table_titles_fts
     USING fts5(table_id UNINDEXED, title, survey, subject, tokenize='unicode61')
     """,
-    "CREATE INDEX IF NOT EXISTS idx_table_titles_fts_id ON table_titles_fts(table_id)",
     # Embeddings table (generic, reused for table titles)
     """
     CREATE TABLE IF NOT EXISTS embeddings (
@@ -73,7 +72,6 @@ DDL: tuple[str, ...] = (
       PRIMARY KEY (entity_type, entity_id, model)
     )
     """,
-    "CREATE INDEX IF NOT EXISTS idx_embeddings_agregado ON embeddings(agregado_id, model)",
 )
 
 INDEXES: tuple[str, ...] = (
@@ -81,6 +79,7 @@ INDEXES: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_link_class_key ON link_class(class_key)",
     "CREATE INDEX IF NOT EXISTS idx_link_cat_keys  ON link_cat(class_key, cat_key)",
     "CREATE INDEX IF NOT EXISTS idx_link_var_class ON link_var_class(var_key, class_key)",
+    "CREATE INDEX IF NOT EXISTS idx_embeddings_agregado ON embeddings(agregado_id, model)",
 )
 
 def apply_search_schema(connection) -> None:

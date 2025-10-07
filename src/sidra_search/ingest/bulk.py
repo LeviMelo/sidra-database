@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from ..net.api_client import SidraApiClient
 from ..db.session import sqlite_session, ensure_full_schema
 from .ingest_table import ingest_table
-from ..config import get_settings
 
 
 @dataclass(frozen=True)

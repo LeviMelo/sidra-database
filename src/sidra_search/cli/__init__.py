@@ -1,0 +1,236 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+from dataclasses import asdict
+from typing import Sequence  # <- added
+
+from ..db.session import ensure_full_schema, sqlite_session
+from ..ingest.ingest_table import ingest_table
+from ..ingest.bulk import ingest_by_coverage
+from ..ingest.links import build_links_for_table
+from ..net.embedding_client import EmbeddingClient
+from ..search.tables import SearchArgs, search_tables
+
+
+def _print_json(obj) -> None:
+    print(json.dumps(obj, ensure_ascii=False, indent=2))
+
+
+# ---------------------------
+# DB admin
+# ---------------------------
+def _cmd_db_migrate(args: argparse.Namespace) -> None:
+    ensure_full_schema()
+    print("Database schema ensured (base + search).")
+
+
+def _cmd_db_stats(args: argparse.Namespace) -> None:
+    ensure_full_schema()
+    with sqlite_session() as conn:
+        counts = {}
+        def c(table: str) -> int:
+            try:
+                return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            except Exception:
+                return 0
+
+        counts["agregados"] = c("agregados")
+        counts["variables"] = c("variables")
+        counts["classifications"] = c("classifications")
+        counts["categories"] = c("categories")
+        counts["periods"] = c("periods")
+        counts["agregados_levels"] = c("agregados_levels")
+        counts["localities"] = c("localities")
+        counts["name_keys"] = c("name_keys")
+        counts["link_var"] = c("link_var")
+        counts["link_class"] = c("link_class")
+        counts["link_cat"] = c("link_cat")
+        counts["link_var_class"] = c("link_var_class")
+        counts["table_titles_fts"] = c("table_titles_fts")
+        try:
+            counts["embeddings_agregado"] = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM embeddings WHERE entity_type='agregado'"
+                ).fetchone()[0]
+            )
+        except Exception:
+            counts["embeddings_agregado"] = 0
+
+    _print_json(counts)
+
+
+# ---------------------------
+# Ingest
+# ---------------------------
+def _cmd_ingest(args: argparse.Namespace) -> None:
+    ensure_full_schema()
+    async def run():
+        for tid in args.table_ids:
+            try:
+                await ingest_table(int(tid))
+                print(f"ingested {tid}")
+            except Exception as exc:
+                print(f"failed {tid}: {exc}")
+    asyncio.run(run())
+
+
+def _cmd_ingest_coverage(args: argparse.Namespace) -> None:
+    ensure_full_schema()
+    report = asyncio.run(
+        ingest_by_coverage(
+            require_any_levels=args.any_level,
+            require_all_levels=args.all_level,
+            exclude_levels=args.exclude_level,
+            subject_contains=args.subject_contains,
+            survey_contains=args.survey_contains,
+            limit=args.limit,
+            concurrency=args.concurrent,
+        )
+    )
+    _print_json(asdict(report))
+
+
+# ---------------------------
+# Index / links
+# ---------------------------
+def _all_table_ids() -> list[int]:
+    with sqlite_session() as conn:
+        rows = conn.execute("SELECT id FROM agregados ORDER BY id").fetchall()
+        return [int(r[0]) for r in rows]
+
+def _cmd_build_links(args: argparse.Namespace) -> None:
+    ensure_full_schema()
+    table_ids = _all_table_ids() if args.all else args.table_ids
+    if not table_ids:
+        print("No table IDs provided.")
+        return
+    for tid in table_ids:
+        c = build_links_for_table(int(tid))
+        print(f"{tid}: vars={c.vars} classes={c.classes} cats={c.cats} var×class={c.var_class}")
+
+
+# ---------------------------
+# Search
+# ---------------------------
+def _cmd_search_tables(args: argparse.Namespace) -> None:
+    ensure_full_schema()
+    sargs = SearchArgs(
+        title=args.title,
+        vars=tuple(args.var or ()),
+        classes=tuple(args.cls or ()),
+        coverage=args.coverage,
+        limit=max(1, args.limit),
+        allow_fuzzy=not args.no_fuzzy,
+        var_th=float(args.var_th),
+        class_th=float(args.class_th),
+        semantic=bool(args.semantic),
+    )
+    emb = EmbeddingClient() if args.semantic else None
+    hits = asyncio.run(search_tables(sargs, embedding_client=emb))
+    if args.json:
+        _print_json([
+            {
+                "id": h.table_id,
+                "title": h.title,
+                "period_start": h.period_start,
+                "period_end": h.period_end,
+                "n3": h.n3,
+                "n6": h.n6,
+                "why": h.why,
+                "score": h.score,
+                "rrf_score": h.rrf_score,
+                "struct_score": h.struct_score,
+            }
+            for h in hits
+        ])
+        return
+    if not hits:
+        print("No results.")
+        return
+    for h in hits:
+        period = ""
+        if h.period_start or h.period_end:
+            if h.period_start and h.period_end and h.period_start != h.period_end:
+                period = f" | {h.period_start}–{h.period_end}"
+            else:
+                period = f" | {h.period_start or h.period_end}"
+        cov = f" | N3={h.n3} N6={h.n6}" if (h.n3 or h.n6) else ""
+        print(f"{h.table_id}: {h.title}{period}{cov}")
+        if args.explain and h.why:
+            print("  matches:", " ".join(f"[{w}]" for w in h.why))
+            print(f"  score={h.score:.3f} (struct={h.struct_score:.3f}, rrf={h.rrf_score:.3f})")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="sidra-search", description="Table-centric search & ingestion")
+    sub = p.add_subparsers(dest="cmd")
+
+    # db
+    dbmig = sub.add_parser("db", help="Database utilities")
+    dbsub = dbmig.add_subparsers(dest="db_cmd")
+
+    db_migrate = dbsub.add_parser("migrate", help="Apply base + search schema")
+    db_migrate.set_defaults(func=_cmd_db_migrate)
+
+    db_stats = dbsub.add_parser("stats", help="Show row counts for key tables")
+    db_stats.set_defaults(func=_cmd_db_stats)
+
+    # ingest single/many
+    ig = sub.add_parser("ingest", help="Ingest one or more table IDs")
+    ig.add_argument("table_ids", type=int, nargs="+")
+    ig.set_defaults(func=_cmd_ingest)
+
+    # ingest by simple coverage discovery
+    ic = sub.add_parser("ingest-coverage", help="Discover by coverage and ingest")
+    ic.add_argument("--any-level", dest="any_level", nargs="+")
+    ic.add_argument("--all-level", dest="all_level", nargs="+")
+    ic.add_argument("--exclude-level", dest="exclude_level", nargs="+")
+    ic.add_argument("--subject-contains")
+    ic.add_argument("--survey-contains")
+    ic.add_argument("--limit", type=int, default=None)
+    ic.add_argument("--concurrent", type=int, default=8)
+    ic.set_defaults(func=_cmd_ingest_coverage)
+
+    # build links
+    bl = sub.add_parser("build-links", help="(Re)build link indexes for tables")
+    bl.add_argument("table_ids", type=int, nargs="*", help="Specific table IDs")
+    bl.add_argument("--all", action="store_true", help="Process all ingested tables")
+    bl.set_defaults(func=_cmd_build_links)
+
+    # search
+    st = sub.add_parser("search", help="Search tables by facets and title")
+    st.add_argument("--title", dest="title", help="free-text title query")
+    st.add_argument("--var", dest="var", action="append", help="variable name (repeatable)")
+    st.add_argument("--class", dest="cls", action="append", help='class name or "Class:Category" (repeatable)')
+    st.add_argument("--coverage", help="boolean coverage expr, e.g. '(N6>=5000) AND (N3>=27)'")
+    st.add_argument("--limit", type=int, default=20)
+    st.add_argument("--no-fuzzy", action="store_true")
+    st.add_argument("--var-th", type=float, default=0.90)
+    st.add_argument("--class-th", type=float, default=0.85)
+    st.add_argument("--semantic", action="store_true", help="use semantic title ranking (requires embeddings)")
+    st.add_argument("--explain", action="store_true", help="print match rationale and scores")
+    st.add_argument("--json", action="store_true")
+    st.set_defaults(func=_cmd_search_tables)
+
+    return p
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    # Support nested: "db migrate"/"db stats"
+    if getattr(args, "cmd", None) == "db" and not hasattr(args, "func"):
+        parser.parse_args(["db", "-h"])
+        return
+
+    if not hasattr(args, "func"):
+        parser.print_help()
+        return
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

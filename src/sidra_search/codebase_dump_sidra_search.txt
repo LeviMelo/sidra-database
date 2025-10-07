@@ -19,8 +19,388 @@ Project structure for '/c/Users/Galaxy/LEVI/projects/sidra-database/src/sidra_se
   search/coverage.py
   search/fuzzy3gram.py
   search/normalize.py
+  search/tables.py
   search/title_rank.py
   util/__init__.py
+
+
+
+###############################################################################
+### FILE: search/tables.py
+###############################################################################
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+from ..db.session import create_connection
+from ..db.migrations import apply_search_schema
+from ..search.normalize import normalize_basic
+from ..search.coverage import parse_coverage_expr, extract_levels, eval_coverage
+from ..search.fuzzy3gram import similar_keys
+from ..search.title_rank import rrf
+from ..net.embedding_client import EmbeddingClient
+from ..config import get_settings
+
+
+@dataclass(frozen=True)
+class TableHit:
+    table_id: int
+    title: str
+    period_start: str | None
+    period_end: str | None
+    n3: int
+    n6: int
+    why: List[str]
+    score: float
+    rrf_score: float
+    struct_score: float
+
+
+@dataclass(frozen=True)
+class SearchArgs:
+    title: str | None
+    vars: Tuple[str, ...]
+    classes: Tuple[str, ...]   # "Class" or "Class:Category"
+    coverage: str | None
+    limit: int
+    allow_fuzzy: bool
+    var_th: float
+    class_th: float
+    semantic: bool    # use embeddings for titles
+
+
+def _split_class(spec: str) -> Tuple[str, Optional[str]]:
+    if ":" in spec:
+        a, b = spec.split(":", 1)
+        return a.strip(), b.strip()
+    return spec.strip(), None
+
+
+def _fts_query(text: str) -> str:
+    toks = [t for t in normalize_basic(text).split() if t]
+    return " ".join(toks)
+
+
+def _tables_for_key(conn, table: str, col: str, keys: Iterable[str]) -> Set[int]:
+    if not keys:
+        return set()
+    tables: Set[int] = set()
+    for key in keys:
+        rows = conn.execute(
+            f"SELECT DISTINCT table_id FROM {table} WHERE {col} = ?", (key,)
+        ).fetchall()
+        ids = {int(r[0]) for r in rows}
+        tables = ids if not tables else tables & ids
+    return tables
+
+
+def _tables_for_class_cat(conn, pairs: Iterable[Tuple[str, str]]) -> Set[int]:
+    if not pairs:
+        return set()
+    tables: Set[int] = set()
+    for ck, catk in pairs:
+        rows = conn.execute(
+            "SELECT DISTINCT table_id FROM link_cat WHERE class_key=? AND cat_key=?",
+            (ck, catk),
+        ).fetchall()
+        ids = {int(r[0]) for r in rows}
+        tables = ids if not tables else tables & ids
+    return tables
+
+
+def _enforce_var_class(conn, table_ids: Set[int], var_keys: Set[str], class_keys: Set[str]) -> Set[int]:
+    if not table_ids or not var_keys or not class_keys:
+        return table_ids
+    keep: Set[int] = set()
+    for tid in table_ids:
+        ok = True
+        for vk in var_keys:
+            for ck in class_keys:
+                row = conn.execute(
+                    """
+                    SELECT 1 FROM link_var_class
+                    WHERE table_id=? AND var_key=? AND class_key=?
+                    LIMIT 1
+                    """,
+                    (tid, vk, ck),
+                ).fetchone()
+                if not row:
+                    ok = False
+                    break
+            if not ok:
+                break
+        if ok:
+            keep.add(tid)
+    return keep
+
+
+async def search_tables(
+    args: SearchArgs,
+    *,
+    embedding_client: EmbeddingClient | None = None,
+) -> List[TableHit]:
+    conn = create_connection()
+    try:
+        apply_search_schema(conn)
+
+        # normalize inputs
+        var_keys_strict = {normalize_basic(v) for v in args.vars if normalize_basic(v)}
+        class_specs = [s for s in args.classes if s and s.strip()]
+        class_pairs = [_split_class(s) for s in class_specs]
+        class_keys_strict = {normalize_basic(a) for (a, b) in class_pairs if normalize_basic(a)}
+        class_cat_pairs = [
+            (normalize_basic(a), normalize_basic(b))
+            for (a, b) in class_pairs
+            if b and normalize_basic(a) and normalize_basic(b)
+        ]
+
+        # initial candidates (intersection)
+        candidates: Optional[Set[int]] = None
+
+        if var_keys_strict:
+            ids = _tables_for_key(conn, "link_var", "var_key", sorted(var_keys_strict))
+            candidates = ids if candidates is None else candidates & ids
+
+        if class_keys_strict:
+            ids = _tables_for_key(conn, "link_class", "class_key", sorted(class_keys_strict))
+            candidates = ids if candidates is None else candidates & ids
+
+        if class_cat_pairs:
+            ids = _tables_for_class_cat(conn, class_cat_pairs)
+            candidates = ids if candidates is None else candidates & ids
+
+        # co-occurrence enforcement (strict only)
+        if candidates and var_keys_strict and class_keys_strict:
+            candidates = _enforce_var_class(conn, candidates, var_keys_strict, class_keys_strict)
+
+        # fuzzy expansions
+        fuzzy_used_vars: Set[str] = set()
+        fuzzy_used_classes: Set[str] = set()
+        if args.allow_fuzzy:
+            if var_keys_strict:
+                expanded = set(var_keys_strict)
+                for v in args.vars:
+                    for key, _ in similar_keys("var", v, threshold=args.var_th, top_k=8):
+                        if key not in var_keys_strict:
+                            expanded.add(key)
+                            fuzzy_used_vars.add(key)
+                if expanded != var_keys_strict:
+                    strict_ids = _tables_for_key(conn, "link_var", "var_key", sorted(var_keys_strict))
+                    fuzzy_only = sorted(expanded - var_keys_strict)
+                    fuzzy_ids: Set[int] = set()
+                    for k in fuzzy_only:
+                        rows = conn.execute("SELECT DISTINCT table_id FROM link_var WHERE var_key=?", (k,)).fetchall()
+                        fuzzy_ids |= {int(r[0]) for r in rows}
+                    ids = (strict_ids | fuzzy_ids) if strict_ids else fuzzy_ids
+                    candidates = ids if candidates is None else candidates & ids
+
+            if class_keys_strict:
+                expanded = set(class_keys_strict)
+                for c_raw, _ in class_pairs:
+                    for key, _ in similar_keys("class", c_raw, threshold=args.class_th, top_k=8):
+                        if key not in class_keys_strict:
+                            expanded.add(key)
+                            fuzzy_used_classes.add(key)
+                if expanded != class_keys_strict:
+                    strict_ids = _tables_for_key(conn, "link_class", "class_key", sorted(class_keys_strict))
+                    fuzzy_only = sorted(expanded - class_keys_strict)
+                    fuzzy_ids: Set[int] = set()
+                    for k in fuzzy_only:
+                        rows = conn.execute("SELECT DISTINCT table_id FROM link_class WHERE class_key=?", (k,)).fetchall()
+                        fuzzy_ids |= {int(r[0]) for r in rows}
+                    ids = (strict_ids | fuzzy_ids) if strict_ids else fuzzy_ids
+                    candidates = ids if candidates is None else candidates & ids
+
+                # keep strict var×class co-occurrence
+                if candidates and var_keys_strict and class_keys_strict:
+                    candidates = _enforce_var_class(conn, candidates, var_keys_strict, class_keys_strict)
+
+        # no structural facets? start from all tables
+        if candidates is None:
+            rows = conn.execute("SELECT id FROM agregados").fetchall()
+            candidates = {int(r[0]) for r in rows}
+
+        if not candidates:
+            return []
+
+        # coverage filter
+        if args.coverage:
+            try:
+                ast = parse_coverage_expr(args.coverage)
+            except Exception:
+                ast = None
+            if ast:
+                needed = extract_levels(ast)
+                keep: Set[int] = set()
+                for tid in candidates:
+                    rows = conn.execute(
+                        "SELECT level_id, locality_count FROM agregados_levels WHERE agregado_id=?",
+                        (tid,),
+                    ).fetchall()
+                    counts = {str(r["level_id"]).upper(): int(r["locality_count"] or 0) for r in rows}
+                    if eval_coverage(ast, counts):
+                        keep.add(tid)
+                candidates = keep
+                if not candidates:
+                    return []
+
+        # title ranking
+        lexical_ranks: Dict[int, int] = {}
+        semantic_ranks: Dict[int, int] = {}
+
+        if args.title and get_settings().enable_titles_fts:
+            q = _fts_query(args.title)
+            if q:
+                rows = conn.execute(
+                    """
+                    SELECT table_id FROM table_titles_fts
+                    WHERE table_titles_fts MATCH ?
+                    """,
+                    (q,),
+                ).fetchall()
+                order: List[int] = []
+                seen: Set[int] = set()
+                for r in rows:
+                    t = int(r[0])
+                    if t in candidates and t not in seen:
+                        seen.add(t); order.append(t)
+                    if len(order) >= args.limit * 5:
+                        break
+                lexical_ranks = {tid: idx + 1 for idx, tid in enumerate(order)}
+
+        if args.title and args.semantic and get_settings().enable_title_embeddings:
+            emb = embedding_client or EmbeddingClient()
+            qvec = await asyncio.to_thread(emb.embed_text, args.title, emb.model)
+            ordered = sorted(candidates)
+            placeholders = ",".join("?" for _ in ordered)
+            sql = (
+                f"SELECT entity_id, dimension, vector "
+                f"FROM embeddings WHERE entity_type='agregado' AND model=? AND entity_id IN ({placeholders})"
+            )
+            cur = conn.execute(sql, (emb.model, *ordered))
+
+            from array import array
+            import math
+
+            def to_vec(blob, dim):
+                arr = array("f"); arr.frombytes(blob); v = list(arr)
+                return v[:dim] if dim and len(v) > dim else v
+
+            def cosine(a: Sequence[float], b: Sequence[float]) -> float:
+                if not a or not b or len(a) != len(b): return 0.0
+                dot = sum(x*y for x,y in zip(a,b))
+                na = math.sqrt(sum(x*x for x in a))
+                nb = math.sqrt(sum(x*x for x in b))
+                return 0.0 if na==0 or nb==0 else dot/(na*nb)
+
+            sims: List[Tuple[int, float]] = []
+            for row in cur.fetchall():
+                tid = int(row["entity_id"])
+                vec = to_vec(row["vector"], int(row["dimension"]))
+                sim = cosine(qvec, vec)
+                if sim > 0:
+                    sims.append((tid, sim))
+            sims.sort(key=lambda x: x[1], reverse=True)
+            top = [tid for (tid, _s) in sims[: args.limit * 5]]
+            semantic_ranks = {tid: idx + 1 for idx, tid in enumerate(top)}
+
+        rrf_scores = rrf({**lexical_ranks, **semantic_ranks}, k=60.0)
+
+        def struct_score_for(tid: int) -> Tuple[float, List[str]]:
+            why: List[str] = []
+            score = 0.0
+
+            for vk in sorted(var_keys_strict):
+                row = conn.execute(
+                    "SELECT 1 FROM link_var WHERE table_id=? AND var_key=? LIMIT 1",
+                    (tid, vk),
+                ).fetchone()
+                if row:
+                    if vk in fuzzy_used_vars:
+                        score += 0.5; why.append(f'var≈"{vk}"')
+                    else:
+                        score += 1.0; why.append(f'var="{vk}"')
+
+            for ck in sorted(class_keys_strict):
+                row = conn.execute(
+                    "SELECT 1 FROM link_class WHERE table_id=? AND class_key=? LIMIT 1",
+                    (tid, ck),
+                ).fetchone()
+                if row:
+                    if ck in fuzzy_used_classes:
+                        score += 0.5; why.append(f'class≈"{ck}"')
+                    else:
+                        score += 1.0; why.append(f'class="{ck}"')
+
+            for (ck, catk) in class_cat_pairs:
+                row = conn.execute(
+                    "SELECT 1 FROM link_cat WHERE table_id=? AND class_key=? AND cat_key=? LIMIT 1",
+                    (tid, ck, catk),
+                ).fetchone()
+                if row:
+                    score += 0.5; why.append(f'{ck}:"{catk}"')
+
+            if var_keys_strict and class_keys_strict:
+                ok_all = True
+                for vk in var_keys_strict:
+                    for ck in class_keys_strict:
+                        row = conn.execute(
+                            "SELECT 1 FROM link_var_class WHERE table_id=? AND var_key=? AND class_key=? LIMIT 1",
+                            (tid, vk, ck),
+                        ).fetchone()
+                        if not row:
+                            ok_all = False; break
+                    if not ok_all: break
+                if ok_all:
+                    score += 0.5; why.append("var×class")
+
+            return score, why
+
+        hits: List[TableHit] = []
+        for tid in candidates:
+            row = conn.execute(
+                "SELECT id, nome, periodo_inicio, periodo_fim FROM agregados WHERE id=?",
+                (tid,),
+            ).fetchone()
+            if not row:
+                continue
+
+            n3r = conn.execute(
+                "SELECT COALESCE(locality_count,0) FROM agregados_levels WHERE agregado_id=? AND level_id='N3'",
+                (tid,),
+            ).fetchone()
+            n6r = conn.execute(
+                "SELECT COALESCE(locality_count,0) FROM agregados_levels WHERE agregado_id=? AND level_id='N6'",
+                (tid,),
+            ).fetchone()
+            n3 = int(n3r[0]) if n3r else 0
+            n6 = int(n6r[0]) if n6r else 0
+
+            struct, why = struct_score_for(tid)
+            rrf_score = float(rrf_scores.get(tid, 0.0))
+            final = 0.7 * struct + 0.3 * rrf_score
+
+            hits.append(
+                TableHit(
+                    table_id=int(row["id"]),
+                    title=str(row["nome"] or ""),
+                    period_start=row["periodo_inicio"],
+                    period_end=row["periodo_fim"],
+                    n3=n3,
+                    n6=n6,
+                    why=why,
+                    score=final,
+                    rrf_score=rrf_score,
+                    struct_score=struct,
+                )
+            )
+
+        hits.sort(key=lambda h: h.score, reverse=True)
+        return hits[: max(1, int(args.limit))]
+    finally:
+        conn.close()
 
 
 
@@ -37,6 +417,168 @@ __all__ = [
     "apply_search_schema",
     "get_search_schema_version",
 ]
+
+
+
+###############################################################################
+### FILE: cli/__init__.py
+###############################################################################
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+from dataclasses import asdict
+
+from ..db.session import ensure_full_schema, sqlite_session
+from ..ingest.ingest_table import ingest_table
+from ..ingest.bulk import ingest_by_coverage
+from ..ingest.links import build_links_for_table
+from ..net.embedding_client import EmbeddingClient
+from ..search.tables import SearchArgs, search_tables
+
+
+def _print_json(obj) -> None:
+    print(json.dumps(obj, ensure_ascii=False, indent=2))
+
+
+def _cmd_ingest(args: argparse.Namespace) -> None:
+    ensure_full_schema()
+    async def run():
+        for tid in args.table_ids:
+            try:
+                await ingest_table(int(tid))
+                print(f"ingested {tid}")
+            except Exception as exc:
+                print(f"failed {tid}: {exc}")
+    asyncio.run(run())
+
+
+def _cmd_ingest_coverage(args: argparse.Namespace) -> None:
+    ensure_full_schema()
+    report = asyncio.run(
+        ingest_by_coverage(
+            require_any_levels=args.any_level,
+            require_all_levels=args.all_level,
+            exclude_levels=args.exclude_level,
+            subject_contains=args.subject_contains,
+            survey_contains=args.survey_contains,
+            limit=args.limit,
+            concurrency=args.concurrent,
+        )
+    )
+    _print_json(asdict(report))
+
+
+def _cmd_build_links(args: argparse.Namespace) -> None:
+    ensure_full_schema()
+    for tid in args.table_ids:
+        c = build_links_for_table(int(tid))
+        print(f"{tid}: vars={c.vars} classes={c.classes} cats={c.cats} var×class={c.var_class}")
+
+
+def _cmd_search_tables(args: argparse.Namespace) -> None:
+    ensure_full_schema()
+    sargs = SearchArgs(
+        title=args.title,
+        vars=tuple(args.var or ()),
+        classes=tuple(args.cls or ()),
+        coverage=args.coverage,
+        limit=max(1, args.limit),
+        allow_fuzzy=not args.no_fuzzy,
+        var_th=float(args.var_th),
+        class_th=float(args.class_th),
+        semantic=bool(args.semantic),
+    )
+    emb = EmbeddingClient() if args.semantic else None
+    hits = asyncio.run(search_tables(sargs, embedding_client=emb))
+    if args.json:
+        _print_json([
+            {
+                "id": h.table_id,
+                "title": h.title,
+                "period_start": h.period_start,
+                "period_end": h.period_end,
+                "n3": h.n3,
+                "n6": h.n6,
+                "why": h.why,
+                "score": h.score,
+                "rrf_score": h.rrf_score,
+                "struct_score": h.struct_score,
+            }
+            for h in hits
+        ])
+        return
+    if not hits:
+        print("No results.")
+        return
+    for h in hits:
+        period = ""
+        if h.period_start or h.period_end:
+            if h.period_start and h.period_end and h.period_start != h.period_end:
+                period = f" | {h.period_start}–{h.period_end}"
+            else:
+                period = f" | {h.period_start or h.period_end}"
+        cov = f" | N3={h.n3} N6={h.n6}" if (h.n3 or h.n6) else ""
+        print(f"{h.table_id}: {h.title}{period}{cov}")
+        if h.why:
+            print("  matches:", " ".join(f"[{w}]" for w in h.why))
+        print(f"  score={h.score:.3f} (struct={h.struct_score:.3f}, rrf={h.rrf_score:.3f})")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="sidra-search", description="Table-centric search & ingestion")
+    sub = p.add_subparsers(dest="cmd")
+
+    # ingest single/many
+    ig = sub.add_parser("ingest", help="Ingest one or more table IDs")
+    ig.add_argument("table_ids", type=int, nargs="+")
+    ig.set_defaults(func=_cmd_ingest)
+
+    # ingest by simple coverage discovery
+    ic = sub.add_parser("ingest-coverage", help="Discover by coverage and ingest")
+    ic.add_argument("--any-level", dest="any_level", nargs="+")
+    ic.add_argument("--all-level", dest="all_level", nargs="+")
+    ic.add_argument("--exclude-level", dest="exclude_level", nargs="+")
+    ic.add_argument("--subject-contains")
+    ic.add_argument("--survey-contains")
+    ic.add_argument("--limit", type=int, default=None)
+    ic.add_argument("--concurrent", type=int, default=8)
+    ic.set_defaults(func=_cmd_ingest_coverage)
+
+    # build links explicitly (usually done automatically by ingest)
+    bl = sub.add_parser("build-links", help="(Re)build link indexes for tables")
+    bl.add_argument("table_ids", type=int, nargs="+")
+    bl.set_defaults(func=_cmd_build_links)
+
+    # search
+    st = sub.add_parser("search", help="Search tables by facets and title")
+    st.add_argument("--title", dest="title", help="free-text title query")
+    st.add_argument("--var", dest="var", action="append", help="variable name (repeatable)")
+    st.add_argument("--class", dest="cls", action="append", help='class name or "Class:Category" (repeatable)')
+    st.add_argument("--coverage", help="boolean coverage expr, e.g. '(N6>=5000) AND (N3>=27)'")
+    st.add_argument("--limit", type=int, default=20)
+    st.add_argument("--no-fuzzy", action="store_true")
+    st.add_argument("--var-th", type=float, default=0.90)
+    st.add_argument("--class-th", type=float, default=0.85)
+    st.add_argument("--semantic", action="store_true", help="use semantic title ranking (requires embeddings)")
+    st.add_argument("--json", action="store_true")
+    st.set_defaults(func=_cmd_search_tables)
+
+    return p
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    if not hasattr(args, "func"):
+        parser.print_help()
+        return
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
 
 
 
@@ -639,6 +1181,431 @@ async def ingest_by_coverage(
 
 
 ###############################################################################
+### FILE: ingest/ingest_table.py
+###############################################################################
+from __future__ import annotations
+
+import asyncio
+import hashlib
+from array import array
+from datetime import datetime, timezone
+from typing import Any, Sequence
+
+import orjson
+
+from ..config import get_settings
+from ..db.session import sqlite_session
+from ..db.migrations import apply_search_schema
+from ..db.base_schema import apply_base_schema
+from ..ingest.links import build_links_for_table
+from ..net.api_client import SidraApiClient
+from ..net.embedding_client import EmbeddingClient
+from ..search.normalize import normalize_basic
+
+ISO = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).strftime(ISO)
+
+
+def _json(obj: Any) -> bytes:
+    return orjson.dumps(obj)
+
+
+def _json_text(obj: Any) -> str:
+    return orjson.dumps(obj).decode("utf-8")
+
+
+def _sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _period_to_ord_kind(periodo_id: Any) -> tuple[int | None, str]:
+    """
+    YYYY -> (YYYY00, 'Y')
+    YYYYMM -> (YYYYMM, 'YM')
+    YYYYMMDD -> (YYYYMMDD, 'YMD')
+    otherwise -> (None, 'UNK')
+    """
+    s = str(periodo_id or "").strip()
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if len(digits) == 4:
+        return int(digits + "00"), "Y"
+    if len(digits) == 6:
+        return int(digits), "YM"
+    if len(digits) == 8:
+        return int(digits), "YMD"
+    return None, "UNK"
+
+
+def _canonical_table_text(md: dict[str, Any]) -> str:
+    periodicidade = md.get("periodicidade") or {}
+    freq = periodicidade.get("frequencia")
+    inicio = periodicidade.get("inicio")
+    fim = periodicidade.get("fim")
+
+    if inicio and fim:
+        period_line = f"Period: {inicio} - {fim}" if inicio != fim else f"Period: {inicio}"
+    elif inicio or fim:
+        period_line = f"Period: {inicio or fim}"
+    else:
+        period_line = None
+
+    nivel = md.get("nivelTerritorial") or {}
+    level_parts: list[str] = []
+    if isinstance(nivel, dict):
+        for level_type in sorted(nivel):
+            codes = nivel.get(level_type) or []
+            if codes:
+                level_parts.append(f"{level_type}: {', '.join(str(c) for c in codes)}")
+
+    lines = [
+        f"Table {md.get('id')}: {str(md.get('nome') or '').strip()}".strip(),
+        f"Survey: {md.get('pesquisa')}" if md.get("pesquisa") else None,
+        f"Subject: {md.get('assunto')}" if md.get("assunto") else None,
+        f"Frequency: {freq}" if freq else None,
+        period_line,
+        f"Territorial levels: {'; '.join(level_parts)}" if level_parts else None,
+        f"URL: {md.get('URL')}" if md.get("URL") else None,
+    ]
+    return "\n".join(l for l in lines if l)
+
+
+def _vec_to_blob(vec: Sequence[float]) -> bytes:
+    arr = array("f", (float(x) for x in vec))
+    return arr.tobytes()
+
+
+async def _ensure_embeddings(table_id: int, text: str, *, embedding_client: EmbeddingClient) -> None:
+    if not text.strip():
+        return
+    text_hash = _sha256_text(text)
+    model = embedding_client.model
+
+    def _read_existing() -> str | None:
+        with sqlite_session() as conn:
+            cur = conn.execute(
+                "SELECT text_hash FROM embeddings "
+                "WHERE entity_type='agregado' AND entity_id=? AND model=?",
+                (str(table_id), model),
+            ).fetchone()
+            return cur["text_hash"] if cur else None
+
+    existing_hash = await asyncio.to_thread(_read_existing)
+    if existing_hash == text_hash:
+        return
+
+    # compute vector
+    vector = await asyncio.to_thread(embedding_client.embed_text, text, model=model)
+    dim = len(vector)
+
+    def _write():
+        with sqlite_session() as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO embeddings(
+                      entity_type, entity_id, agregado_id, text_hash, model, dimension, vector, created_at
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        "agregado",
+                        str(table_id),
+                        table_id,
+                        text_hash,
+                        model,
+                        dim,
+                        _vec_to_blob(vector),
+                        _now(),
+                    ),
+                )
+
+    await asyncio.to_thread(_write)
+
+
+async def ingest_table(
+    table_id: int,
+    *,
+    client: SidraApiClient | None = None,
+    embedding_client: EmbeddingClient | None = None,
+    build_links: bool = True,
+) -> None:
+    """
+    Fetch metadata from SIDRA and persist into base + search schemas.
+    Also refresh the table title FTS row and (optionally) a title embedding.
+    """
+    # ensure schema
+    with sqlite_session() as conn:
+        apply_base_schema(conn)
+        apply_search_schema(conn)
+        conn.commit()
+
+    own_client = False
+    if client is None:
+        client = SidraApiClient()
+        own_client = True
+
+    try:
+        # --- fetch payloads
+        try:
+            md = await client.fetch_metadata(table_id)
+        except Exception:
+            _log_ingestion(table_id, "error", "api:metadata")
+            raise
+        try:
+            periods = await client.fetch_periods(table_id)
+        except Exception:
+            _log_ingestion(table_id, "error", "api:periods")
+            raise
+
+        # --- derive levels + localities (count + names)
+        nivel_groups = md.get("nivelTerritorial") or {}
+        if not isinstance(nivel_groups, dict):
+            nivel_groups = {}
+
+        settings = get_settings()
+        municipality_count = 0
+        level_rows: list[tuple[int, str, str | None, str, int]] = []
+        locality_rows: list[tuple[int, str, str | None, str | None]] = []
+
+        for level_type, codes in nivel_groups.items():
+            if not codes:
+                continue
+            for code in codes:
+                # fetch localities per code
+                try:
+                    payload = await client.fetch_localities(table_id, str(code))
+                except Exception:
+                    payload = []
+                if not isinstance(payload, list):
+                    try:
+                        payload = list(payload)
+                    except Exception:
+                        payload = []
+
+                count = len(payload)
+                if str(code).upper() == "N6":
+                    municipality_count = max(municipality_count, count)
+
+                level_name = None
+                if payload:
+                    level_name = (payload[0].get("nivel") or {}).get("nome")
+
+                level_rows.append(
+                    (table_id, str(code), level_name, str(level_type), count)
+                )
+                for loc in payload:
+                    locality_rows.append(
+                        (table_id, str(code), loc.get("id"), loc.get("nome"))
+                    )
+
+        covers_nat = (
+            1
+            if (municipality_count >= max(0, int(settings.municipality_national_threshold)))
+            else 0
+        )
+
+        # variables
+        variables = md.get("variaveis") or []
+        var_rows: list[tuple[Any, int, Any, Any, str, str]] = []
+        for v in variables:
+            var_rows.append(
+                (
+                    v.get("id"),
+                    table_id,
+                    v.get("nome"),
+                    v.get("unidade"),
+                    _json_text(v.get("sumarizacao", [])),
+                    _sha256_text("||".join([str(v.get("id")), v.get("nome", ""), v.get("unidade", "")])),
+                )
+            )
+
+        # classifications + categories
+        class_rows: list[tuple[int, int, str | None, int, str]] = []
+        cat_rows: list[tuple[int, int, int, str | None, str | None, Any, str]] = []
+        for cl in md.get("classificacoes", []) or []:
+            cid = cl.get("id")
+            class_rows.append(
+                (
+                    cid,
+                    table_id,
+                    cl.get("nome"),
+                    1 if (cl.get("sumarizacao", {}).get("status")) else 0,
+                    _json_text(cl.get("sumarizacao", {}).get("excecao", [])),
+                )
+            )
+            for cat in cl.get("categorias", []) or []:
+                cat_rows.append(
+                    (
+                        table_id,
+                        cid,
+                        cat.get("id"),
+                        cat.get("nome"),
+                        cat.get("unidade"),
+                        cat.get("nivel"),
+                        _sha256_text("||".join([str(cid), str(cat.get("id")), cat.get("nome",""), cat.get("unidade","")])),
+                    )
+                )
+
+        # periods
+        period_rows: list[tuple[int, str, str, Any, int | None, str]] = []
+        for p in periods or []:
+            pid = p.get("id") if isinstance(p, dict) else p
+            literals = p.get("literals", [pid]) if isinstance(p, dict) else [pid]
+            modificacao = p.get("modificacao") if isinstance(p, dict) else None
+            ord_val, kind = _period_to_ord_kind(pid)
+            period_rows.append((table_id, str(pid), _json_text(literals), modificacao, ord_val, kind))
+
+        # --- write to DB (replace child rows)
+        fetched_at = _now()
+
+        with sqlite_session() as conn:
+            apply_base_schema(conn)
+            apply_search_schema(conn)
+
+            conn.execute("BEGIN")
+            try:
+                # parent: agregados header
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO agregados(
+                      id, nome, pesquisa, assunto, url, freq, periodo_inicio, periodo_fim,
+                      raw_json, fetched_at, municipality_locality_count, covers_national_municipalities
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        md.get("id"),
+                        md.get("nome"),
+                        md.get("pesquisa"),
+                        md.get("assunto"),
+                        md.get("URL"),
+                        (md.get("periodicidade") or {}).get("frequencia"),
+                        (md.get("periodicidade") or {}).get("inicio"),
+                        (md.get("periodicidade") or {}).get("fim"),
+                        _json(md),
+                        fetched_at,
+                        municipality_count,
+                        covers_nat,
+                    ),
+                )
+
+                # purge children → insert fresh
+                conn.execute("DELETE FROM localities WHERE agregado_id=?", (table_id,))
+                conn.execute("DELETE FROM agregados_levels WHERE agregado_id=?", (table_id,))
+                conn.execute("DELETE FROM categories WHERE agregado_id=?", (table_id,))
+                conn.execute("DELETE FROM classifications WHERE agregado_id=?", (table_id,))
+                conn.execute("DELETE FROM variables WHERE agregado_id=?", (table_id,))
+                conn.execute("DELETE FROM periods WHERE agregado_id=?", (table_id,))
+
+                if level_rows:
+                    conn.executemany(
+                        """
+                        INSERT OR REPLACE INTO agregados_levels(
+                          agregado_id, level_id, level_name, level_type, locality_count
+                        ) VALUES(?,?,?,?,?)
+                        """,
+                        level_rows,
+                    )
+                if var_rows:
+                    conn.executemany(
+                        """
+                        INSERT OR REPLACE INTO variables(
+                          id, agregado_id, nome, unidade, sumarizacao, text_hash
+                        ) VALUES(?,?,?,?,?,?)
+                        """,
+                        var_rows,
+                    )
+                if class_rows:
+                    conn.executemany(
+                        """
+                        INSERT OR REPLACE INTO classifications(
+                          id, agregado_id, nome, sumarizacao_status, sumarizacao_excecao
+                        ) VALUES(?,?,?,?,?)
+                        """,
+                        class_rows,
+                    )
+                if cat_rows:
+                    conn.executemany(
+                        """
+                        INSERT OR REPLACE INTO categories(
+                          agregado_id, classification_id, categoria_id, nome, unidade, nivel, text_hash
+                        ) VALUES(?,?,?,?,?,?,?)
+                        """,
+                        cat_rows,
+                    )
+                if period_rows:
+                    conn.executemany(
+                        """
+                        INSERT OR REPLACE INTO periods(
+                          agregado_id, periodo_id, literals, modificacao, periodo_ord, periodo_kind
+                        ) VALUES(?,?,?,?,?,?)
+                        """,
+                        period_rows,
+                    )
+                if locality_rows:
+                    conn.executemany(
+                        """
+                        INSERT OR REPLACE INTO localities(
+                          agregado_id, level_id, locality_id, nome
+                        ) VALUES(?,?,?,?)
+                        """,
+                        locality_rows,
+                    )
+
+                # refresh FTS for title/survey/subject
+                conn.execute("DELETE FROM table_titles_fts WHERE table_id=?", (table_id,))
+                conn.execute(
+                    "INSERT INTO table_titles_fts(table_id, title, survey, subject) VALUES(?,?,?,?)",
+                    (
+                        table_id,
+                        md.get("nome") or "",
+                        md.get("pesquisa") or "",
+                        md.get("assunto") or "",
+                    ),
+                )
+
+                # log
+                conn.execute(
+                    "INSERT INTO ingestion_log(agregado_id, stage, status, detail, run_at) VALUES(?,?,?,?,?)",
+                    (table_id, "metadata", "success", None, fetched_at),
+                )
+
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                _log_ingestion(table_id, "error", "db:write")
+                raise
+
+        # build name→table link indexes
+        if build_links:
+            await asyncio.to_thread(build_links_for_table, table_id)
+
+        # optional embeddings for title text
+        if get_settings().enable_title_embeddings:
+            embedding_client = embedding_client or EmbeddingClient()
+            text = _canonical_table_text(md)
+            await _ensure_embeddings(table_id, text, embedding_client=embedding_client)
+
+    finally:
+        if own_client:
+            await client.close()
+
+
+def _log_ingestion(table_id: int, status: str, detail: str) -> None:
+    with sqlite_session() as conn:
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO ingestion_log(agregado_id, stage, status, detail, run_at)
+                VALUES(?,?,?,?,?)
+                """,
+                (table_id, "metadata", status, detail, _now()),
+            )
+
+
+
+###############################################################################
 ### FILE: ingest/links.py
 ###############################################################################
 from __future__ import annotations
@@ -1100,6 +2067,24 @@ from typing import Mapping, Dict
 
 def rrf(ranks: Mapping[int, int], k: float = 60.0) -> Dict[int, float]:
     return {k_: 1.0 / (k + r) for k_, r in ranks.items()}
+
+
+
+###############################################################################
+### FILE: util/__init__.py
+###############################################################################
+from __future__ import annotations
+
+import hashlib
+from datetime import datetime, timezone
+
+ISO = "%Y-%m-%dT%H:%M:%SZ"
+
+def utcnow_iso() -> str:
+    return datetime.now(timezone.utc).strftime(ISO)
+
+def sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
 
