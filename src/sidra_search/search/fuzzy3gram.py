@@ -97,6 +97,26 @@ def similar_keys(
         results = process.extract(
             q, choices, scorer=_rf_score, limit=max(10, top_k * 5), score_cutoff=max(0, cutoff - 12)
         )
+        
+    # Pass 2.5 — single-token: compare the query against individual tokens in each key.
+    # This pulls in long names containing a near-match token (e.g., "pessoas" vs "pessoal").
+    if not results and tok_count == 1:
+        hits = []
+        for key in choices:
+            tokens = key.replace("-", " ").split()
+            best = 0
+            for t in tokens:
+                s = fuzz.ratio(q, t)
+                if s > best:
+                    best = s
+                if best >= 86:  # short-circuit when very close
+                    break
+            # tolerate near misses like "pessoal"↔"pessoas"
+            if best >= max(68, cutoff - 15):
+                hits.append((key, best))
+        hits.sort(key=lambda x: x[1], reverse=True)
+        results = [(k, s, None) for (k, s) in hits[: max(10, top_k * 5)]]
+
 
     # Pass 3 — if still empty, try a robust single scorer (WRatio), no cutoff
     if not results:
