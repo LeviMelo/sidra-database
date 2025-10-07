@@ -1,0 +1,1105 @@
+Project structure for '/c/Users/Galaxy/LEVI/projects/sidra-database/src/sidra_search':
+===============================================================================
+  __init__.py
+  cli/__init__.py
+  config.py
+  db/__init__.py
+  db/base_schema.py
+  db/migrations.py
+  db/search_schema.py
+  db/session.py
+  ingest/__init__.py
+  ingest/bulk.py
+  ingest/ingest_table.py
+  ingest/links.py
+  net/__init__.py
+  net/api_client.py
+  net/embedding_client.py
+  search/__init__.py
+  search/coverage.py
+  search/fuzzy3gram.py
+  search/normalize.py
+  search/title_rank.py
+  util/__init__.py
+
+
+
+###############################################################################
+### FILE: __init__.py
+###############################################################################
+"""sidra_search — table-centric search (titles + var/class links + fuzzy)."""
+
+from .db.migrations import apply_search_schema, get_search_schema_version  # noqa: F401
+from .db.base_schema import apply_base_schema  # noqa: F401
+
+__all__ = [
+    "apply_base_schema",
+    "apply_search_schema",
+    "get_search_schema_version",
+]
+
+
+
+###############################################################################
+### FILE: config.py
+###############################################################################
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from functools import lru_cache
+
+
+@dataclass(frozen=True)
+class Settings:
+    # HTTP
+    sidra_base_url: str = "https://servicodados.ibge.gov.br/api/v3/agregados"
+    request_timeout: float = 30.0
+    request_retries: int = 3
+    user_agent: str = "sidra-search/0.1"
+
+    # DB
+    database_timeout: float = 60.0
+    municipality_national_threshold: int = 5000
+
+    # Embeddings (optional, for title semantics)
+    embedding_api_url: str = "http://127.0.0.1:1234/v1/embeddings"
+    embedding_model: str = "text-embedding-qwen3-embedding-0.6b@f16"
+
+    # Features
+    enable_titles_fts: bool = True
+    enable_title_embeddings: bool = True
+
+
+def _env(name: str) -> str | None:
+    for key in (name, name.upper(), name.lower()):
+        if key in os.environ:
+            return os.environ[key]
+    return None
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    d = Settings().__dict__.copy()
+
+    # strings
+    for f in ("sidra_base_url", "user_agent", "embedding_api_url", "embedding_model"):
+        v = _env(f"SIDRA_SEARCH_{f.upper()}")
+        if v:
+            d[f] = v
+
+    # numerics/bools
+    def _float(env, key):
+        v = _env(env)
+        if v:
+            try: d[key] = float(v)
+            except: pass
+
+    def _int(env, key):
+        v = _env(env)
+        if v:
+            try: d[key] = int(v)
+            except: pass
+
+    def _bool(env, key):
+        v = _env(env)
+        if v is not None:
+            d[key] = v not in ("0", "false", "False", "")
+
+    _float("SIDRA_SEARCH_REQUEST_TIMEOUT", "request_timeout")
+    _float("SIDRA_SEARCH_DATABASE_TIMEOUT", "database_timeout")
+    _int("SIDRA_SEARCH_REQUEST_RETRIES", "request_retries")
+    _int("SIDRA_SEARCH_MUNICIPALITY_NATIONAL_THRESHOLD", "municipality_national_threshold")
+    _bool("SIDRA_SEARCH_ENABLE_TITLES_FTS", "enable_titles_fts")
+    _bool("SIDRA_SEARCH_ENABLE_TITLE_EMBEDDINGS", "enable_title_embeddings")
+
+    return Settings(**d)
+
+
+
+###############################################################################
+### FILE: db/base_schema.py
+###############################################################################
+from __future__ import annotations
+
+TABLE_STATEMENTS: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS agregados (
+        id INTEGER PRIMARY KEY,
+        nome TEXT NOT NULL,
+        pesquisa TEXT,
+        assunto TEXT,
+        url TEXT,
+        freq TEXT,
+        periodo_inicio TEXT,
+        periodo_fim TEXT,
+        raw_json BLOB NOT NULL,
+        fetched_at TEXT NOT NULL,
+        municipality_locality_count INTEGER DEFAULT 0,
+        covers_national_municipalities INTEGER DEFAULT 0
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS agregados_levels (
+        agregado_id INTEGER NOT NULL,
+        level_id TEXT NOT NULL,
+        level_name TEXT,
+        level_type TEXT NOT NULL,
+        locality_count INTEGER DEFAULT 0,
+        PRIMARY KEY (agregado_id, level_id, level_type),
+        FOREIGN KEY (agregado_id) REFERENCES agregados(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS variables (
+        id          INTEGER NOT NULL,
+        agregado_id INTEGER NOT NULL,
+        nome        TEXT NOT NULL,
+        unidade     TEXT,
+        sumarizacao TEXT,
+        text_hash   TEXT NOT NULL,
+        PRIMARY KEY (agregado_id, id),
+        FOREIGN KEY (agregado_id) REFERENCES agregados(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS classifications (
+        id INTEGER NOT NULL,
+        agregado_id INTEGER NOT NULL,
+        nome TEXT NOT NULL,
+        sumarizacao_status INTEGER,
+        sumarizacao_excecao TEXT,
+        PRIMARY KEY (agregado_id, id),
+        FOREIGN KEY (agregado_id) REFERENCES agregados(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS categories (
+        agregado_id INTEGER NOT NULL,
+        classification_id INTEGER NOT NULL,
+        categoria_id INTEGER NOT NULL,
+        nome TEXT NOT NULL,
+        unidade TEXT,
+        nivel INTEGER,
+        text_hash TEXT NOT NULL,
+        PRIMARY KEY (agregado_id, classification_id, categoria_id),
+        FOREIGN KEY (agregado_id, classification_id) REFERENCES classifications(agregado_id, id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS periods (
+        agregado_id INTEGER NOT NULL,
+        periodo_id TEXT NOT NULL,
+        literals TEXT NOT NULL,
+        modificacao TEXT,
+        periodo_ord INTEGER,
+        periodo_kind TEXT,
+        PRIMARY KEY (agregado_id, periodo_id),
+        FOREIGN KEY (agregado_id) REFERENCES agregados(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS localities (
+        agregado_id INTEGER NOT NULL,
+        level_id TEXT NOT NULL,
+        locality_id TEXT NOT NULL,
+        nome TEXT NOT NULL,
+        PRIMARY KEY (agregado_id, level_id, locality_id),
+        FOREIGN KEY (agregado_id, level_id) REFERENCES agregados_levels(agregado_id, level_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ingestion_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agregado_id INTEGER NOT NULL,
+        stage TEXT NOT NULL,
+        status TEXT NOT NULL,
+        detail TEXT,
+        run_at TEXT NOT NULL
+    )
+    """,
+)
+
+INDEX_STATEMENTS: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS idx_variables_agregado ON variables(agregado_id)",
+    "CREATE INDEX IF NOT EXISTS idx_categories_agregado ON categories(agregado_id, classification_id)",
+    "CREATE INDEX IF NOT EXISTS idx_localities_agregado ON localities(agregado_id, level_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS u_agregados_levels_pair ON agregados_levels(agregado_id, level_id)",
+    "CREATE INDEX IF NOT EXISTS idx_periods_agregado_ord ON periods(agregado_id, periodo_ord)",
+)
+
+def apply_base_schema(connection) -> None:
+    cur = connection.cursor()
+    for stmt in TABLE_STATEMENTS:
+        cur.execute(stmt)
+    for stmt in INDEX_STATEMENTS:
+        cur.execute(stmt)
+    connection.commit()
+
+
+
+###############################################################################
+### FILE: db/migrations.py
+###############################################################################
+from __future__ import annotations
+
+import sqlite3
+
+from .search_schema import apply_search_schema as _apply_schema
+
+SEARCH_SCHEMA_VERSION = 4
+KEY = "sidra_search_schema_version"
+
+def _ensure_meta(connection: sqlite3.Connection) -> None:
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS meta_kv(
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        )
+    """)
+
+def get_search_schema_version(connection: sqlite3.Connection) -> int:
+    _ensure_meta(connection)
+    cur = connection.execute("SELECT value FROM meta_kv WHERE key = ?", (KEY,))
+    row = cur.fetchone()
+    return int(row[0]) if row else 0
+
+def bump_search_schema_version(connection: sqlite3.Connection, to_version: int) -> None:
+    _ensure_meta(connection)
+    connection.execute(
+        "INSERT INTO meta_kv(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (KEY, str(to_version)),
+    )
+
+def apply_search_schema(connection: sqlite3.Connection) -> None:
+    current = get_search_schema_version(connection)
+    if current >= SEARCH_SCHEMA_VERSION:
+        return
+    with connection:
+        _apply_schema(connection)
+        bump_search_schema_version(connection, SEARCH_SCHEMA_VERSION)
+
+
+
+###############################################################################
+### FILE: db/search_schema.py
+###############################################################################
+from __future__ import annotations
+
+DDL: tuple[str, ...] = (
+    # meta kv (shared)
+    """
+    CREATE TABLE IF NOT EXISTS meta_kv(
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )
+    """,
+    # link keys
+    """
+    CREATE TABLE IF NOT EXISTS name_keys (
+      kind TEXT NOT NULL,     -- 'var' | 'class' | 'cat'
+      key  TEXT NOT NULL,     -- normalized
+      raw  TEXT NOT NULL,     -- original
+      UNIQUE(kind, key, raw)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS link_var (
+      var_key    TEXT NOT NULL,
+      table_id   INTEGER NOT NULL,
+      variable_id INTEGER NOT NULL,
+      UNIQUE(var_key, table_id, variable_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS link_class (
+      class_key TEXT NOT NULL,
+      table_id  INTEGER NOT NULL,
+      class_id  INTEGER NOT NULL,
+      UNIQUE(class_key, table_id, class_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS link_cat (
+      class_key  TEXT NOT NULL,
+      cat_key    TEXT NOT NULL,
+      table_id   INTEGER NOT NULL,
+      class_id   INTEGER NOT NULL,
+      category_id INTEGER NOT NULL,
+      UNIQUE(class_key, cat_key, table_id, class_id, category_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS link_var_class (
+      var_key   TEXT NOT NULL,
+      class_key TEXT NOT NULL,
+      table_id  INTEGER NOT NULL,
+      variable_id INTEGER NOT NULL,
+      class_id    INTEGER NOT NULL,
+      UNIQUE(var_key, class_key, table_id, variable_id, class_id)
+    )
+    """,
+    # FTS for titles
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS table_titles_fts
+    USING fts5(table_id UNINDEXED, title, survey, subject, tokenize='unicode61')
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_table_titles_fts_id ON table_titles_fts(table_id)",
+    # Embeddings table (generic, reused for table titles)
+    """
+    CREATE TABLE IF NOT EXISTS embeddings (
+      entity_type TEXT NOT NULL,   -- 'agregado'
+      entity_id   TEXT NOT NULL,   -- table_id as text
+      agregado_id INTEGER,         -- optional convenience (same as entity_id)
+      text_hash   TEXT NOT NULL,
+      model       TEXT NOT NULL,
+      dimension   INTEGER NOT NULL,
+      vector      BLOB NOT NULL,
+      created_at  TEXT NOT NULL,
+      PRIMARY KEY (entity_type, entity_id, model)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_embeddings_agregado ON embeddings(agregado_id, model)",
+)
+
+INDEXES: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS idx_link_var_key   ON link_var(var_key)",
+    "CREATE INDEX IF NOT EXISTS idx_link_class_key ON link_class(class_key)",
+    "CREATE INDEX IF NOT EXISTS idx_link_cat_keys  ON link_cat(class_key, cat_key)",
+    "CREATE INDEX IF NOT EXISTS idx_link_var_class ON link_var_class(var_key, class_key)",
+)
+
+def apply_search_schema(connection) -> None:
+    cur = connection.cursor()
+    for stmt in DDL:
+        cur.execute(stmt)
+    for stmt in INDEXES:
+        cur.execute(stmt)
+    connection.commit()
+
+
+
+###############################################################################
+### FILE: db/session.py
+###############################################################################
+from __future__ import annotations
+
+import os
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator
+
+from ..config import get_settings
+from .base_schema import apply_base_schema
+from .migrations import apply_search_schema
+
+
+def _has_base_tables(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        conn = sqlite3.connect(path)
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('agregados','variables')"
+        )
+        names = {r[0] for r in cur.fetchall()}
+        return "agregados" in names and "variables" in names
+    except sqlite3.Error:
+        return False
+    finally:
+        try: conn.close()
+        except: pass
+
+
+def _resolve_db_path() -> Path:
+    env = os.getenv("SIDRA_DATABASE_PATH")
+    if env:
+        p = Path(env).expanduser().resolve()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+    # default
+    p = Path("sidra.db").resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+_DB_PATH: Path | None = None
+
+def get_database_path() -> Path:
+    global _DB_PATH
+    if _DB_PATH is None:
+        _DB_PATH = _resolve_db_path()
+    return _DB_PATH
+
+
+def create_connection() -> sqlite3.Connection:
+    s = get_settings()
+    conn = sqlite3.connect(
+        get_database_path(),
+        timeout=max(float(s.database_timeout), 30.0),
+        check_same_thread=False,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(f"PRAGMA busy_timeout = {int(max(s.database_timeout, 60.0) * 1000)}")
+    return conn
+
+
+@contextmanager
+def sqlite_session() -> Iterator[sqlite3.Connection]:
+    conn = create_connection()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def ensure_full_schema() -> None:
+    conn = create_connection()
+    try:
+        apply_base_schema(conn)
+        apply_search_schema(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+
+###############################################################################
+### FILE: ingest/bulk.py
+###############################################################################
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable, Sequence
+
+from ..net.api_client import SidraApiClient
+from ..db.session import sqlite_session, ensure_full_schema
+from .ingest_table import ingest_table
+from ..config import get_settings
+
+
+@dataclass(frozen=True)
+class CatalogEntry:
+    id: int
+    nome: str | None
+    pesquisa: str | None
+    pesquisa_id: int | None
+    assunto: str | None
+    assunto_id: int | None
+    periodicidade: Any
+    nivel_territorial: dict[str, list[str]]
+    level_hints: frozenset[str] = frozenset()
+
+    @property
+    def level_codes(self) -> set[str]:
+        codes: set[str] = set()
+        for vals in self.nivel_territorial.values():
+            for v in vals:
+                codes.add(str(v).upper())
+        codes.update(self.level_hints)
+        return codes
+
+def _normalize_levels(payload: Any) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
+    if isinstance(payload, dict):
+        for k, vals in payload.items():
+            arr = vals if isinstance(vals, list) else [vals]
+            out = []
+            for it in arr:
+                if isinstance(it, str):
+                    out.append(it.upper())
+                elif isinstance(it, dict):
+                    code = it.get("codigo") or it.get("nivel") or it.get("id")
+                    if isinstance(code, str): out.append(code.upper())
+            if out: result[str(k)] = out
+    return result
+
+async def fetch_catalog_entries(
+    *, client: SidraApiClient | None = None, subject_id: int | None = None,
+    periodicity: str | None = None, levels: Sequence[str] | None = None
+) -> list[CatalogEntry]:
+    own = False
+    if client is None:
+        client = SidraApiClient()
+        own = True
+    normalized_levels = [c.upper() for c in levels or [] if c]
+    try:
+        catalog = await client.fetch_catalog(subject_id=subject_id, periodicity=periodicity, levels=normalized_levels or None)
+    finally:
+        if own:
+            await client.close()
+
+    out: list[CatalogEntry] = []
+    if not isinstance(catalog, list): return out
+    for survey in catalog:
+        ags = survey.get("agregados") if isinstance(survey, dict) else None
+        if not isinstance(ags, list): continue
+        for ag in ags:
+            if not isinstance(ag, dict): continue
+            entry = CatalogEntry(
+                id = int(ag.get("id")),
+                nome = ag.get("nome") or ag.get("tabela"),
+                pesquisa = survey.get("pesquisa") or survey.get("nome"),
+                pesquisa_id = survey.get("idPesquisa") or survey.get("id"),
+                assunto = (survey.get("assunto") or {}).get("nome") if isinstance(survey.get("assunto"), dict) else survey.get("assunto"),
+                assunto_id = (survey.get("assunto") or {}).get("id") if isinstance(survey.get("assunto"), dict) else survey.get("idAssunto"),
+                periodicidade = survey.get("periodicidade"),
+                nivel_territorial = _normalize_levels(ag.get("nivelTerritorial")),
+                level_hints = frozenset(c.upper() for c in normalized_levels),
+            )
+            out.append(entry)
+    return out
+
+def filter_catalog_entries(
+    entries: Sequence[CatalogEntry], *,
+    require_any_levels: Iterable[str] | None = None,
+    require_all_levels: Iterable[str] | None = None,
+    exclude_levels: Iterable[str] | None = None,
+    subject_contains: str | None = None,
+    survey_contains: str | None = None,
+) -> list[CatalogEntry]:
+    any_levels = {c.upper() for c in require_any_levels or ()}
+    all_levels = {c.upper() for c in require_all_levels or ()}
+    excluded  = {c.upper() for c in exclude_levels or ()}
+    subj_q = subject_contains.lower() if subject_contains else None
+    surv_q = survey_contains.lower() if survey_contains else None
+
+    out: list[CatalogEntry] = []
+    for e in entries:
+        codes = e.level_codes
+        if any_levels and not (codes & any_levels): continue
+        if all_levels and not all_levels.issubset(codes): continue
+        if excluded and (codes & excluded): continue
+        if subj_q and (e.assunto or "").lower().find(subj_q) == -1: continue
+        if surv_q and (e.pesquisa or "").lower().find(surv_q) == -1: continue
+        out.append(e)
+    return out
+
+
+@dataclass
+class BulkReport:
+    discovered_ids: list[int] = field(default_factory=list)
+    scheduled_ids: list[int] = field(default_factory=list)
+    skipped_existing: list[int] = field(default_factory=list)
+    ingested_ids: list[int] = field(default_factory=list)
+    failed: list[tuple[int, str]] = field(default_factory=list)
+
+
+async def ingest_by_coverage(
+    *, require_any_levels: Iterable[str] | None = None,
+    require_all_levels: Iterable[str] | None = None,
+    exclude_levels: Iterable[str] | None = None,
+    subject_contains: str | None = None,
+    survey_contains: str | None = None,
+    limit: int | None = None,
+    concurrency: int = 8,
+) -> BulkReport:
+    ensure_full_schema()
+    report = BulkReport()
+    async with SidraApiClient() as client:
+        entries = await fetch_catalog_entries(
+            client=client, levels=[*(require_any_levels or ()), *(require_all_levels or ())]
+        )
+        entries = filter_catalog_entries(
+            entries,
+            require_any_levels=require_any_levels,
+            require_all_levels=require_all_levels,
+            exclude_levels=exclude_levels,
+            subject_contains=subject_contains,
+            survey_contains=survey_contains,
+        )
+        if limit is not None and limit >= 0:
+            entries = entries[:limit]
+        report.discovered_ids = [e.id for e in entries]
+
+        # skip already ingested (optional)
+        with sqlite_session() as conn:
+            existing = {int(r[0]) for r in conn.execute("SELECT id FROM agregados")}
+        to_do = [e.id for e in entries if e.id not in existing]
+        report.scheduled_ids = list(to_do)
+
+        sem = asyncio.Semaphore(max(1, concurrency))
+        async def worker(tid: int) -> None:
+            async with sem:
+                try:
+                    await ingest_table(tid)
+                    report.ingested_ids.append(tid)
+                except Exception as exc:
+                    report.failed.append((tid, str(exc)[:200]))
+
+        await asyncio.gather(*(worker(t) for t in to_do))
+    return report
+
+
+
+###############################################################################
+### FILE: ingest/links.py
+###############################################################################
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+from ..db.session import create_connection
+from ..db.migrations import apply_search_schema
+from ..search.normalize import normalize_basic
+
+
+@dataclass
+class LinkCounts:
+    vars: int = 0
+    classes: int = 0
+    cats: int = 0
+    var_class: int = 0
+
+
+def _delete_links_for_table(conn, table_id: int) -> None:
+    with conn:
+        conn.execute("DELETE FROM link_var WHERE table_id = ?", (table_id,))
+        conn.execute("DELETE FROM link_class WHERE table_id = ?", (table_id,))
+        conn.execute("DELETE FROM link_cat WHERE table_id = ?", (table_id,))
+        conn.execute("DELETE FROM link_var_class WHERE table_id = ?", (table_id,))
+
+
+def _infer_var_class_pairs(metadata_json: dict) -> List[Tuple[int, int]]:
+    """
+    Optional hook: try to infer actual applicable {variable_id, class_id} pairs from metadata.
+    For now, return empty (fallback to cross-product).
+    """
+    return []
+
+
+def build_links_for_table(table_id: int) -> LinkCounts:
+    conn = create_connection()
+    try:
+        apply_search_schema(conn)
+
+        # load rows
+        var_rows = conn.execute(
+            "SELECT id, nome FROM variables WHERE agregado_id = ? ORDER BY id", (table_id,)
+        ).fetchall()
+        class_rows = conn.execute(
+            "SELECT id, nome FROM classifications WHERE agregado_id = ? ORDER BY id", (table_id,)
+        ).fetchall()
+        cat_rows = conn.execute(
+            """
+            SELECT classification_id, categoria_id, nome
+            FROM categories
+            WHERE agregado_id = ?
+            ORDER BY classification_id, categoria_id
+            """,
+            (table_id,),
+        ).fetchall()
+        if not var_rows and not class_rows:
+            return LinkCounts()
+
+        cats_by_class: Dict[int, List[Tuple[int, str]]] = {}
+        for cr in cat_rows:
+            cats_by_class.setdefault(int(cr["classification_id"]), []).append((int(cr["categoria_id"]), cr["nome"]))
+
+        _delete_links_for_table(conn, table_id)
+
+        with conn:
+            # variables
+            for vr in var_rows:
+                v_id = int(vr["id"]); raw = str(vr["nome"] or ""); key = normalize_basic(raw)
+                if not key: continue
+                conn.execute("INSERT OR IGNORE INTO name_keys(kind,key,raw) VALUES(?,?,?)", ("var", key, raw))
+                conn.execute(
+                    "INSERT OR IGNORE INTO link_var(var_key, table_id, variable_id) VALUES(?,?,?)",
+                    (key, table_id, v_id),
+                )
+
+            # classes & cats
+            for cl in class_rows:
+                c_id = int(cl["id"]); raw = str(cl["nome"] or ""); key = normalize_basic(raw)
+                if not key: continue
+                conn.execute("INSERT OR IGNORE INTO name_keys(kind,key,raw) VALUES(?,?,?)", ("class", key, raw))
+                conn.execute(
+                    "INSERT OR IGNORE INTO link_class(class_key, table_id, class_id) VALUES(?,?,?)",
+                    (key, table_id, c_id),
+                )
+                for cat_id, cat_raw in cats_by_class.get(c_id, []):
+                    cat_key = normalize_basic(str(cat_raw or ""))
+                    if not cat_key: continue
+                    conn.execute("INSERT OR IGNORE INTO name_keys(kind,key,raw) VALUES(?,?,?)", ("cat", cat_key, cat_raw))
+                    conn.execute(
+                        "INSERT OR IGNORE INTO link_cat(class_key, cat_key, table_id, class_id, category_id) VALUES(?,?,?,?,?)",
+                        (key, cat_key, table_id, c_id, int(cat_id)),
+                    )
+
+            # var×class pairs — cross-product fallback
+            inferred = set(_infer_var_class_pairs({}))  # reserved for future use
+            if inferred:
+                to_pairs = inferred
+            else:
+                to_pairs = {(int(vr["id"]), int(cl["id"])) for vr in var_rows for cl in class_rows}
+
+            for v_id, c_id in to_pairs:
+                v_key = normalize_basic(str(next((vr["nome"] for vr in var_rows if int(vr["id"])==v_id), "")))
+                c_key = normalize_basic(str(next((cr["nome"] for cr in class_rows if int(cr["id"])==c_id), "")))
+                if not v_key or not c_key: continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO link_var_class(var_key, class_key, table_id, variable_id, class_id) VALUES(?,?,?,?,?)",
+                    (v_key, c_key, table_id, v_id, c_id),
+                )
+
+        c_var = conn.execute("SELECT COUNT(*) FROM link_var WHERE table_id=?", (table_id,)).fetchone()[0]
+        c_cls = conn.execute("SELECT COUNT(*) FROM link_class WHERE table_id=?", (table_id,)).fetchone()[0]
+        c_cat = conn.execute("SELECT COUNT(*) FROM link_cat WHERE table_id=?", (table_id,)).fetchone()[0]
+        c_vc  = conn.execute("SELECT COUNT(*) FROM link_var_class WHERE table_id=?", (table_id,)).fetchone()[0]
+        return LinkCounts(c_var, c_cls, c_cat, c_vc)
+    finally:
+        conn.close()
+
+
+
+###############################################################################
+### FILE: net/api_client.py
+###############################################################################
+from __future__ import annotations
+
+import asyncio
+from typing import Any, Mapping, Self
+
+import httpx
+import orjson
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+from ..config import get_settings
+
+
+class SidraApiError(RuntimeError):
+    pass
+
+
+class SidraApiClient:
+    def __init__(self, *, base_url: str | None = None, timeout: float | None = None) -> None:
+        s = get_settings()
+        self._client = httpx.AsyncClient(
+            base_url=base_url or s.sidra_base_url,
+            timeout=timeout or s.request_timeout,
+            headers={"User-Agent": s.user_agent},
+        )
+
+    async def __aenter__(self) -> Self: return self
+    async def __aexit__(self, *_): await self.close()
+    async def close(self) -> None: await self._client.aclose()
+
+    @retry(
+        stop=stop_after_attempt(get_settings().request_retries),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type((httpx.TransportError, SidraApiError)),
+        reraise=True,
+    )
+    async def _get_json(self, path: str, params: Mapping[str, Any] | None = None) -> Any:
+        r = await self._client.get(path, params=params)
+        if r.status_code in (429,) or r.status_code >= 500:
+            raise SidraApiError(f"SIDRA API failed {r.status_code}: {r.text[:200]}")
+        if r.status_code >= 400:
+            raise RuntimeError(f"SIDRA API failed {r.status_code}: {r.text[:200]}")
+        return orjson.loads(r.content)
+
+    async def fetch_metadata(self, agregado_id: int) -> Any:
+        return await self._get_json(f"/{agregado_id}/metadados")
+
+    async def fetch_periods(self, agregado_id: int) -> Any:
+        return await self._get_json(f"/{agregado_id}/periodos")
+
+    async def fetch_localities(self, agregado_id: int, level: str) -> Any:
+        return await self._get_json(f"/{agregado_id}/localidades/{level}")
+
+    async def fetch_catalog(self, *, subject_id: int | None = None, periodicity: str | None = None,
+                            levels: list[str] | None = None) -> Any:
+        params: dict[str, Any] = {}
+        if subject_id is not None: params["assunto"] = subject_id
+        if periodicity: params["periodicidade"] = periodicity
+        if levels:
+            lv = [c.upper() for c in levels if c]
+            if lv: params["nivel"] = "|".join(lv)
+        return await self._get_json("", params=params or None)
+
+
+def fetch_metadata_sync(agregado_id: int) -> Any:
+    async def _r() -> Any:
+        async with SidraApiClient() as c:
+            return await c.fetch_metadata(agregado_id)
+    return asyncio.run(_r())
+
+
+__all__ = ["SidraApiClient", "SidraApiError", "fetch_metadata_sync"]
+
+
+
+###############################################################################
+### FILE: net/embedding_client.py
+###############################################################################
+from __future__ import annotations
+
+from typing import Iterable, Sequence
+
+import httpx
+import orjson
+
+from ..config import get_settings
+
+
+class EmbeddingClient:
+    def __init__(self, *, base_url: str | None = None, model: str | None = None, timeout: float | None = None) -> None:
+        s = get_settings()
+        self._base_url = base_url or s.embedding_api_url
+        self._model = model or s.embedding_model
+        self._timeout = timeout or s.request_timeout
+        self._headers = {"Content-Type": "application/json", "User-Agent": s.user_agent}
+
+    @property
+    def model(self) -> str: return self._model
+
+    def embed_text(self, text: str, *, model: str | None = None) -> Sequence[float]:
+        payload = {"model": model or self._model, "input": text}
+        r = httpx.post(self._base_url, content=orjson.dumps(payload), headers=self._headers, timeout=self._timeout)
+        r.raise_for_status()
+        data = r.json()
+        return data["data"][0]["embedding"]
+
+    def embed_batch(self, texts: Iterable[str], *, model: str | None = None) -> list[Sequence[float]]:
+        payload = {"model": model or self._model, "input": list(texts)}
+        r = httpx.post(self._base_url, content=orjson.dumps(payload), headers=self._headers, timeout=self._timeout)
+        r.raise_for_status()
+        data = r.json()
+        return [item["embedding"] for item in data["data"]]
+
+
+
+###############################################################################
+### FILE: search/coverage.py
+###############################################################################
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Iterator
+
+@dataclass(frozen=True)
+class _Tok:
+    kind: str
+    value: str
+    pos: int
+
+def _tokens(s: str) -> Iterator[_Tok]:
+    i, n = 0, len(s)
+    while i < n:
+        ch = s[i]
+        if ch.isspace(): i += 1; continue
+        if ch in '()':
+            yield _Tok('LP' if ch=='(' else 'RP', ch, i); i += 1; continue
+        if i+1<n:
+            two = s[i:i+2]
+            if two in ('>=','<=','==','!=','&&'): yield _Tok('OP' if two!='&&' else 'AND', two, i); i += 2; continue
+        if ch in ('<','>','='): yield _Tok('OP', ch, i); i += 1; continue
+        if ch.isalpha() or ch=='_':
+            start=i; i+=1
+            while i<n and (s[i].isalnum() or s[i]=='_'): i+=1
+            word = s[start:i].upper()
+            if word in ('AND','OR','NOT'): yield _Tok(word, word, start)
+            else: yield _Tok('ID', word, start)
+            continue
+        if ch.isdigit():
+            start=i; i+=1
+            while i<n and s[i].isdigit(): i+=1
+            yield _Tok('NUM', s[start:i], start); continue
+        if ch=='|':
+            if i+1<n and s[i+1]=='|': yield _Tok('OR','||',i); i+=2; continue
+        if ch=='!': yield _Tok('NOT','!',i); i+=1; continue
+        raise SyntaxError(f"Unexpected {ch!r} at {i}")
+    yield _Tok('EOF','',n)
+
+@dataclass(frozen=True)
+class _Cmp: op: str; ident: str; number: int
+@dataclass(frozen=True)
+class _Not: node: Any
+@dataclass(frozen=True)
+class _And: left: Any; right: Any
+@dataclass(frozen=True)
+class _Or: left: Any; right: Any
+
+class _Parser:
+    def __init__(self, text: str) -> None:
+        self._it = iter(_tokens(text)); self.cur = next(self._it)
+    def _eat(self, kind: str) -> _Tok:
+        if self.cur.kind != kind: raise SyntaxError(f"Expected {kind}, got {self.cur.kind} at {self.cur.pos}")
+        t = self.cur; self.cur = next(self._it); return t
+    def parse(self) -> Any:
+        n = self._expr()
+        if self.cur.kind != 'EOF': raise SyntaxError(f"Unexpected {self.cur.kind} at {self.cur.pos}")
+        return n
+    def _expr(self) -> Any:
+        n = self._and()
+        while self.cur.kind == 'OR':
+            self._eat('OR'); n = _Or(n, self._and())
+        return n
+    def _and(self) -> Any:
+        n = self._unary()
+        while self.cur.kind == 'AND':
+            self._eat('AND'); n = _And(n, self._unary())
+        return n
+    def _unary(self) -> Any:
+        if self.cur.kind=='NOT': self._eat('NOT'); return _Not(self._unary())
+        return self._primary()
+    def _primary(self) -> Any:
+        if self.cur.kind=='LP':
+            self._eat('LP'); n=self._expr(); self._eat('RP'); return n
+        return self._cmp()
+    def _cmp(self) -> Any:
+        ident = self._eat('ID').value
+        op = self._eat('OP').value
+        if op == '=': op = '=='
+        number = int(self._eat('NUM').value)
+        return _Cmp(op, ident, number)
+
+def parse_coverage_expr(text: str) -> Any: return _Parser(text).parse()
+
+def extract_levels(node: Any) -> set[str]:
+    out: set[str] = set()
+    def _w(n: Any) -> None:
+        if isinstance(n, _Cmp): out.add(n.ident)
+        elif isinstance(n, _Not): _w(n.node)
+        elif isinstance(n, (_And,_Or)): _w(n.left); _w(n.right)
+    _w(node)
+    return out
+
+def eval_coverage(node: Any, counts: dict[str,int]) -> bool:
+    def _cmp(op: str, a: int, b: int) -> bool:
+        return {'>=':a>=b,'>':a>b,'<=':a<=b,'<':a<b,'==':a==b,'!=':a!=b}[op]
+    def _ev(n: Any) -> bool:
+        if isinstance(n,_Cmp): return _cmp(n.op, int(counts.get(n.ident,0)), n.number)
+        if isinstance(n,_Not): return not _ev(n.node)
+        if isinstance(n,_And): return _ev(n.left) and _ev(n.right)
+        if isinstance(n,_Or): return _ev(n.left) or _ev(n.right)
+        raise TypeError(f"Bad node {n}")
+    return _ev(node)
+
+
+
+###############################################################################
+### FILE: search/fuzzy3gram.py
+###############################################################################
+from __future__ import annotations
+
+from collections import Counter
+from math import sqrt, log
+from typing import Dict, List, Tuple
+
+from ..db.session import create_connection
+from ..db.migrations import apply_search_schema
+from .normalize import normalize_basic
+
+_CORPUS: Dict[str, Dict[str, Counter]] = {"var": {}, "class": {}}
+_IDF: Dict[str, Dict[str, float]] = {"var": {}, "class": {}}
+_BUILT = False
+
+def reset_cache() -> None:
+    global _BUILT
+    _BUILT = False
+    _CORPUS["var"].clear()
+    _CORPUS["class"].clear()
+    _IDF["var"].clear()
+    _IDF["class"].clear()
+
+def _trigrams(s: str) -> Counter:
+    s = f"  {s}  "
+    return Counter(s[i:i+3] for i in range(len(s)-2))
+
+def _build() -> None:
+    global _BUILT
+    if _BUILT: return
+    conn = create_connection()
+    try:
+        apply_search_schema(conn)
+        var_keys = [normalize_basic(r[0]) for r in conn.execute("SELECT DISTINCT nome FROM variables")]
+        class_keys = [normalize_basic(r[0]) for r in conn.execute("SELECT DISTINCT nome FROM classifications")]
+        for kind, keys in (("var", var_keys), ("class", class_keys)):
+            keys = [k for k in keys if k]
+            docs: Dict[str, Counter] = {}
+            df: Counter = Counter()
+            for key in keys:
+                grams = _trigrams(key)
+                docs[key] = grams
+                for g in grams.keys():
+                    df[g] += 1
+            N = max(1, len(keys))
+            _CORPUS[kind] = docs
+            _IDF[kind] = {g: log((N + 1) / (dfg + 1)) + 1.0 for g, dfg in df.items()}
+        _BUILT = True
+    finally:
+        conn.close()
+
+def _vec(kind: str, text: str) -> Dict[str, float]:
+    grams = _trigrams(text)
+    idf = _IDF[kind]
+    return {g: tf * idf.get(g, 1.0) for g, tf in grams.items()}
+
+def _cos(a: Dict[str, float], b: Dict[str, float]) -> float:
+    if not a or not b: return 0.0
+    dot = sum(va * b.get(k, 0.0) for k, va in a.items())
+    na = sqrt(sum(v*v for v in a.values()))
+    nb = sqrt(sum(v*v for v in b.values()))
+    if na == 0.0 or nb == 0.0: return 0.0
+    return dot / (na * nb)
+
+def similar_keys(kind: str, query_raw: str, *, threshold: float, top_k: int = 10) -> List[Tuple[str, float]]:
+    assert kind in ("var", "class")
+    _build()
+    q = normalize_basic(query_raw)
+    if not q: return []
+    qv = _vec(kind, q)
+    out: List[Tuple[str, float]] = []
+    for key, grams in _CORPUS[kind].items():
+        sv = {g: tf * _IDF[kind].get(g, 1.0) for g, tf in grams.items()}
+        s = _cos(qv, sv)
+        if s >= threshold:
+            out.append((key, s))
+    out.sort(key=lambda x: x[1], reverse=True)
+    return out[:top_k]
+
+
+
+###############################################################################
+### FILE: search/normalize.py
+###############################################################################
+from __future__ import annotations
+
+import re
+import unicodedata
+
+_WS = re.compile(r"\s+")
+_PUNCT = re.compile(r"[^\w\s]", re.UNICODE)  # keep letters/digits/underscore
+
+def normalize_basic(s: str | None) -> str:
+    if not s: return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower()
+    s = s.replace("\u00A0", " ")
+    s = _WS.sub(" ", s).strip()
+    s = _PUNCT.sub(" ", s)
+    s = _WS.sub(" ", s).strip()
+    return s
+
+
+
+###############################################################################
+### FILE: search/title_rank.py
+###############################################################################
+from __future__ import annotations
+from typing import Mapping, Dict
+
+def rrf(ranks: Mapping[int, int], k: float = 60.0) -> Dict[int, float]:
+    return {k_: 1.0 / (k + r) for k_, r in ranks.items()}
+
+
+
