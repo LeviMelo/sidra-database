@@ -151,6 +151,7 @@ async def ingest_table(
     client: SidraApiClient | None = None,
     embedding_client: EmbeddingClient | None = None,
     build_links: bool = True,
+    prefetched_localities: dict[str, list] | None = None,  # optional reuse from probe
 ) -> None:
     """
     Fetch metadata from SIDRA and persist into base + search schemas.
@@ -190,36 +191,66 @@ async def ingest_table(
         level_rows: list[tuple[int, str, str | None, str, int]] = []
         locality_rows: list[tuple[int, str, str | None, str | None]] = []
 
-        for level_type, codes in nivel_groups.items():
+        # NOTE:
+        # - `prefetched_localities` is a dict like {"N3": [...], "N6": [...]} if passed by the caller.
+        # - Keys we store/reuse are UPPERCASE to avoid case mismatches.
+        for level_type, codes in (nivel_groups or {}).items():
             if not codes:
                 continue
-            for code in codes:
-                # fetch localities per code
-                try:
-                    payload = await client.fetch_localities(table_id, str(code))
-                except Exception:
-                    payload = []
-                if not isinstance(payload, list):
+            # Be defensive: ensure we can iterate even if API returned a scalar.
+            try:
+                code_list = list(codes)
+            except TypeError:
+                code_list = [codes]
+
+            for code in code_list:
+                code_s = str(code)
+                code_key = code_s.upper()
+
+                # Prefer the probe's cached payload for this level (e.g., N3/N6).
+                payload: list | None = None
+                if prefetched_localities and isinstance(prefetched_localities.get(code_key), list):
+                    payload = prefetched_localities[code_key]
+                else:
                     try:
-                        payload = list(payload)
+                        payload = await client.fetch_localities(table_id, code_s)
                     except Exception:
                         payload = []
+                    if not isinstance(payload, list):
+                        try:
+                            payload = list(payload)
+                        except Exception:
+                            payload = []
 
+                # Count first (coverage uses counts only)
                 count = len(payload)
-                if str(code).upper() == "N6":
+                if code_key == "N6":
                     municipality_count = max(municipality_count, count)
 
+                # Try to extract a representative level_name (same as before)
                 level_name = None
                 if payload:
-                    level_name = (payload[0].get("nivel") or {}).get("nome")
+                    try:
+                        node = payload[0].get("nivel") if isinstance(payload[0], dict) else None
+                        if isinstance(node, dict):
+                            level_name = node.get("nome")
+                    except Exception:
+                        level_name = None
 
-                level_rows.append(
-                    (table_id, str(code), level_name, str(level_type), count)
-                )
-                for loc in payload:
-                    locality_rows.append(
-                        (table_id, str(code), loc.get("id"), loc.get("nome"))
-                    )
+                # Record per-level counts
+                level_rows.append((table_id, code_s, level_name, str(level_type), count))
+
+                # Persist exact membership (unchanged behavior)
+                if payload:
+                    for loc in payload:
+                        if isinstance(loc, dict):
+                            lid = loc.get("id")
+                            lname = loc.get("nome")
+                        else:
+                            lid = None
+                            lname = None
+                        locality_rows.append((table_id, code_s, lid, lname))
+
 
         covers_nat = (
             1

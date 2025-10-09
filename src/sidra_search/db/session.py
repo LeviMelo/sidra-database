@@ -57,10 +57,23 @@ def create_connection() -> sqlite3.Connection:
         check_same_thread=False,
     )
     conn.row_factory = sqlite3.Row
+
+    # Safety + performance (no semantic change):
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA synchronous=NORMAL")  # durable enough, already in code
     conn.execute(f"PRAGMA busy_timeout = {int(max(s.database_timeout, 60.0) * 1000)}")
+
+    # Added: speed up big batch inserts & temp btrees
+    # cache_size: negative => value is in KiB (here ~128 MiB)
+    conn.execute("PRAGMA cache_size = -131072")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    # Use mmap when supported (safe fallback if OS/FS refuses)
+    try:
+        conn.execute("PRAGMA mmap_size = 268435456")  # 256 MiB
+    except Exception:
+        pass
+
     return conn
 
 

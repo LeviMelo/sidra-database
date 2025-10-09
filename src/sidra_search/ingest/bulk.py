@@ -160,23 +160,33 @@ async def _probe_counts_for_levels(
     client: SidraApiClient,
     table_id: int,
     levels: Iterable[str],
-) -> dict[str, int]:
+) -> tuple[dict[str, int], dict[str, list]]:
     """
-    Fetch locality lists per level for a table and return {LEVEL: count}.
-    Levels are normalized to UPPERCASE strings. Non-list responses count as 0.
+    Fetch locality lists per level for a table and return:
+      - counts: {LEVEL: count}
+      - payloads: {LEVEL: list_of_localities}  (for reuse during ingest)
+    Levels are normalized to UPPERCASE strings. Non-list responses are treated as empty lists.
     """
-    counts: dict[str, int] = {}
-    for lvl in {str(l).upper() for l in levels if l}:
+    lvls = sorted({str(l).upper() for l in levels if l})
+    if not lvls:
+        return {}, {}
+
+    async def one(lvl: str) -> tuple[str, list]:
         try:
             payload = await client.fetch_localities(table_id, lvl)
             if isinstance(payload, list):
-                counts[lvl] = len(payload)
-            else:
-                # defensive: sometimes API oddities; treat non-list as 0
-                counts[lvl] = 0
+                return (lvl, payload)
+            try:
+                return (lvl, list(payload))
+            except Exception:
+                return (lvl, [])
         except Exception:
-            counts[lvl] = 0
-    return counts
+            return (lvl, [])
+
+    results = await asyncio.gather(*(one(l) for l in lvls))
+    payloads: dict[str, list] = {k: v for (k, v) in results}
+    counts: dict[str, int] = {k: (len(v) if isinstance(v, list) else 0) for k, v in payloads.items()}
+    return counts, payloads
 
 async def _subject_gate_with_metadata(
     *,
@@ -292,6 +302,9 @@ async def ingest_by_coverage(
     """
     ensure_full_schema()
     report = BulkReport()
+    
+    # Cache per-table locality payloads for levels we probed (e.g., N3/N6)
+    prefetched_localities: dict[int, dict[str, list]] = {}
 
     # Parse coverage and extract hinted levels
     try:
@@ -350,17 +363,17 @@ async def ingest_by_coverage(
             if not check_levels:
                 return True
 
-            async def _one(e_: CatalogEntry) -> tuple[CatalogEntry, bool]:
+            async def _one(e_: CatalogEntry) -> tuple[CatalogEntry, bool, dict[str, list]]:
                 per_table_timeout = max(10.0, 2.0 * float(get_settings().request_timeout))
                 try:
-                    counts = await asyncio.wait_for(
+                    counts, payloads = await asyncio.wait_for(
                         _probe_counts_for_levels(client, e_.id, check_levels),
                         timeout=per_table_timeout,
                     )
                     ok = eval_coverage(cov_ast, counts)
-                    return e_, ok
+                    return e_, ok, payloads if ok else {}
                 except Exception:
-                    return e_, False
+                    return e_, False, {}
 
             t = asyncio.create_task(_one(e))
             pending.add(t)
@@ -373,14 +386,22 @@ async def ingest_by_coverage(
         probed = 0
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for t in done:
-                probed += 1
-                e, ok = await t
-                if ok:
-                    kept.append(e)
+        for t in done:
+            probed += 1
+            e, ok, payloads = await t
+            if ok:
+                kept.append(e)
+                if payloads:
+                    prefetched_localities[e.id] = payloads
                 if (probed % 10 == 0) or (need and len(kept) >= need):
                     pct = (probed * 100) // max(1, total)
-                    print(f"\r[probe] probed={probed}/{total} kept={len(kept)} ({pct}%)", end="", flush=True)
+                    inflight = len(pending)
+                    print(
+                        f"\r[probe] done={probed}/{total} "
+                        f"(accepted={len(kept)} • {pct}%) | inflight={inflight}",
+                        end="",
+                        flush=True,
+                    )
                 if need and len(kept) >= need:
                     pending.clear()
                     break
@@ -411,7 +432,10 @@ async def ingest_by_coverage(
         async def worker(tid: int) -> None:
             async with sem:
                 try:
-                    await ingest_table(tid)
+                    await ingest_table(
+                        tid,
+                        prefetched_localities=prefetched_localities.get(tid),
+                    )
                     report.ingested_ids.append(tid)
                     print(f"  ingested {tid}")
                 except Exception as exc:

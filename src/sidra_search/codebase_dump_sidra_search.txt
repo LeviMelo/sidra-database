@@ -23,6 +23,7 @@ Project structure for '/c/Users/Galaxy/LEVI/projects/sidra-database/src/sidra_se
   search/normalize.py
   search/tables.py
   search/title_rank.py
+  smoke.sh
   util/__init__.py
 
 
@@ -71,7 +72,7 @@ from ..ingest.links import build_links_for_table
 from ..net.embedding_client import EmbeddingClient
 from ..search.tables import SearchArgs, search_tables
 from ..search.fuzzy3gram import reset_cache
-
+from ..db.session import sqlite_session
 
 def _print_json(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2))
@@ -186,6 +187,7 @@ def _cmd_search_tables(args: argparse.Namespace) -> None:
         var_th=float(args.var_th),
         class_th=float(args.class_th),
         semantic=bool(args.semantic),
+        debug_fuzzy=bool(args.debug_fuzzy),
     )
     emb = EmbeddingClient() if args.semantic else None
     hits = asyncio.run(search_tables(sargs, embedding_client=emb))
@@ -209,18 +211,27 @@ def _cmd_search_tables(args: argparse.Namespace) -> None:
     if not hits:
         print("No results.")
         return
-    for h in hits:
-        period = ""
-        if h.period_start or h.period_end:
-            if h.period_start and h.period_end and h.period_start != h.period_end:
-                period = f" | {h.period_start}–{h.period_end}"
-            else:
-                period = f" | {h.period_start or h.period_end}"
-        cov = f" | N3={h.n3} N6={h.n6}" if (h.n3 or h.n6) else ""
-        print(f"{h.table_id}: {h.title}{period}{cov}")
-        if args.explain and h.why:
-            print("  matches:", " ".join(f"[{w}]" for w in h.why))
-            print(f"  score={h.score:.3f} (struct={h.struct_score:.3f}, rrf={h.rrf_score:.3f})")
+    with sqlite_session() as _conn:
+        for h in hits:
+            period = ""
+            if h.period_start or h.period_end:
+                if h.period_start and h.period_end and h.period_start != h.period_end:
+                    period = f" | {h.period_start}–{h.period_end}"
+                else:
+                    period = f" | {h.period_start or h.period_end}"
+            cov = f" | N3={h.n3} N6={h.n6}" if (h.n3 or h.n6) else ""
+            print(f"{h.table_id}: {h.title}{period}{cov}")
+
+            if args.show_classes:
+                names = [r[0] for r in _conn.execute(
+                    "SELECT nome FROM classifications WHERE agregado_id=? ORDER BY id LIMIT 3", (h.table_id,)
+                ).fetchall()]
+                if names:
+                    print("  classes:", "; ".join(names))
+
+            if args.explain and h.why:
+                print("  matches:", " ".join(f"[{w}]" for w in h.why))
+                print(f"  score={h.score:.3f} (struct={h.struct_score:.3f}, rrf={h.rrf_score:.3f})")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -266,13 +277,14 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--coverage", help="boolean coverage expr, e.g. '(N6>=5000) AND (N3>=27)'")
     st.add_argument("--limit", type=int, default=20)
     st.add_argument("--no-fuzzy", action="store_true")
-    st.add_argument("--var-th", type=float, default=0.80)
+    st.add_argument("--var-th", type=float, default=0.74)
     st.add_argument("--class-th", type=float, default=0.78)
     st.add_argument("--semantic", action="store_true", help="use semantic title ranking (requires embeddings)")
     st.add_argument("--explain", action="store_true", help="print match rationale and scores")
     st.add_argument("--json", action="store_true")
     st.set_defaults(func=_cmd_search_tables)
-
+    st.add_argument("--show-classes", action="store_true", help="List up to 3 classification names for each hit")
+    st.add_argument("--debug-fuzzy", action="store_true", help="Print fuzzy expansions and candidate counts")
     return p
 
 
@@ -748,6 +760,7 @@ from ..db.session import sqlite_session, ensure_full_schema
 from .ingest_table import ingest_table
 from ..search.coverage import parse_coverage_expr, extract_levels, eval_coverage
 from ..config import get_settings
+from ..search.normalize import normalize_basic
 
 @dataclass(frozen=True)
 class CatalogEntry:
@@ -785,6 +798,41 @@ def _normalize_levels(payload: Any) -> dict[str, list[str]]:
             if out: result[str(k)] = out
     return result
 
+def _extract_subject_fields(survey: Any, ag: Any) -> tuple[str | None, int | None]:
+    """
+    Try hard to extract a human-readable subject name and id
+    from either the table (agregado) or the survey object.
+    Handles: plain str, nested dict {'nome','id'}, and a few common aliases.
+    """
+    def _name_and_id(obj: Any) -> tuple[str | None, int | None]:
+        if not isinstance(obj, dict):
+            return None, None
+        v = obj.get("assunto")
+        # variante 1: nested object
+        if isinstance(v, dict):
+            name = v.get("nome") or v.get("name")
+            sid  = v.get("id") or obj.get("idAssunto")
+            return (name if isinstance(name, str) else None,
+                    int(sid) if isinstance(sid, (int, str)) and str(sid).isdigit() else None)
+        # variante 2: plain string
+        if isinstance(v, str):
+            sid = obj.get("idAssunto")
+            return v, int(sid) if isinstance(sid, (int, str)) and str(sid).isdigit() else None
+        # variante 3: loose aliases some payloads use
+        for k in ("assuntoNome", "assunto_nome", "assuntoDescricao", "assunto_descricao"):
+            w = obj.get(k)
+            if isinstance(w, str):
+                sid = obj.get("idAssunto")
+                return w, int(sid) if isinstance(sid, (int, str)) and str(sid).isdigit() else None
+        return None, None
+
+    # Prefer table-level, fallback to survey-level
+    a_name, a_id = _name_and_id(ag)
+    if a_name:
+        return a_name, a_id
+    s_name, s_id = _name_and_id(survey)
+    return s_name, s_id
+
 async def fetch_catalog_entries(
     *, client: SidraApiClient | None = None, subject_id: int | None = None,
     periodicity: str | None = None, levels: Sequence[str] | None = None
@@ -807,13 +855,15 @@ async def fetch_catalog_entries(
         if not isinstance(ags, list): continue
         for ag in ags:
             if not isinstance(ag, dict): continue
+            assunto_name, assunto_id = _extract_subject_fields(survey, ag)
+
             entry = CatalogEntry(
                 id = int(ag.get("id")),
                 nome = ag.get("nome") or ag.get("tabela"),
                 pesquisa = survey.get("pesquisa") or survey.get("nome"),
                 pesquisa_id = survey.get("idPesquisa") or survey.get("id"),
-                assunto = (survey.get("assunto") or {}).get("nome") if isinstance(survey.get("assunto"), dict) else survey.get("assunto"),
-                assunto_id = (survey.get("assunto") or {}).get("id") if isinstance(survey.get("assunto"), dict) else survey.get("idAssunto"),
+                assunto = assunto_name,
+                assunto_id = assunto_id,
                 periodicidade = survey.get("periodicidade"),
                 nivel_territorial = _normalize_levels(ag.get("nivelTerritorial")),
                 level_hints = frozenset(c.upper() for c in normalized_levels),
@@ -832,8 +882,8 @@ def filter_catalog_entries(
     any_levels = {c.upper() for c in require_any_levels or ()}
     all_levels = {c.upper() for c in require_all_levels or ()}
     excluded  = {c.upper() for c in exclude_levels or ()}
-    subj_q = subject_contains.lower() if subject_contains else None
-    surv_q = survey_contains.lower() if survey_contains else None
+    subj_q = normalize_basic(subject_contains) if subject_contains else None
+    surv_q = normalize_basic(survey_contains) if survey_contains else None
 
     out: list[CatalogEntry] = []
     for e in entries:
@@ -841,8 +891,10 @@ def filter_catalog_entries(
         if any_levels and not (codes & any_levels): continue
         if all_levels and not all_levels.issubset(codes): continue
         if excluded and (codes & excluded): continue
-        if subj_q and (e.assunto or "").lower().find(subj_q) == -1: continue
-        if surv_q and (e.pesquisa or "").lower().find(surv_q) == -1: continue
+        subj_val = normalize_basic(e.assunto or "")
+        surv_val = normalize_basic(e.pesquisa or "")
+        if subj_q and subj_q not in subj_val: continue
+        if surv_q and surv_q not in surv_val: continue
         out.append(e)
     return out
 
@@ -877,6 +929,100 @@ async def _probe_counts_for_levels(
             counts[lvl] = 0
     return counts
 
+async def _subject_gate_with_metadata(
+    *,
+    entries: list["CatalogEntry"],
+    subject_contains: str,
+    client: SidraApiClient,
+    need: int | None,
+    parallel: int,
+) -> list["CatalogEntry"]:
+    """
+    Keep only entries whose SUBJECT matches `subject_contains`.
+    Prefer catalog subject; otherwise check local DB; otherwise fetch /{id}/metadados.
+    Bounded concurrency, early-stop, and progress ticks.
+    """
+    q = normalize_basic(subject_contains)
+    if not q:
+        return entries
+
+    total = len(entries)
+    kept: list[CatalogEntry] = []
+    done = 0
+
+    print(f"[subject] filtering {total} entries by assunto~{subject_contains!r} (parallel={parallel})")
+
+    async def check_one(e: CatalogEntry) -> tuple[CatalogEntry, bool]:
+        # 0) DB cache (already ingested)
+        with sqlite_session() as conn:
+            row = conn.execute("SELECT assunto FROM agregados WHERE id=?", (e.id,)).fetchone()
+        if row and row[0]:
+            subj_db = normalize_basic(str(row[0] or ""))
+            if subj_db and (q in subj_db):
+                return e, True
+            # DB had a subject and it didn't match → skip network
+            return e, False
+
+        # 1) catalog-provided subject
+        subj_cat = normalize_basic(e.assunto or "")
+        if subj_cat and (q in subj_cat):
+            return e, True
+
+        # 2) fallback: metadata
+        per_table_timeout = max(10.0, 2.0 * float(get_settings().request_timeout))
+        try:
+            md = await asyncio.wait_for(client.fetch_metadata(e.id), timeout=per_table_timeout)
+        except Exception:
+            return e, False
+
+        subj = md.get("assunto")
+        if isinstance(subj, dict):
+            subj = subj.get("nome")
+        subj = normalize_basic(str(subj or ""))
+        return e, (q in subj)
+
+    sem = asyncio.Semaphore(max(1, int(parallel)))
+    it = iter(entries)
+    pending: set[asyncio.Task] = set()
+
+    async def schedule_next() -> bool:
+        try:
+            e = next(it)
+        except StopIteration:
+            return False
+        async def _task():
+            async with sem:
+                return await check_one(e)
+        t = asyncio.create_task(_task())
+        pending.add(t)
+        return True
+
+    # prime
+    for _ in range(parallel):
+        if not await schedule_next():
+            break
+
+    # drain with progress + early-stop
+    while pending:
+        done_set, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for t in done_set:
+            e, ok = await t
+            done += 1
+            if ok:
+                kept.append(e)
+            if (done % 10 == 0) or (need and len(kept) >= need):
+                pct = (done * 100) // max(1, total)
+                print(f"\r[subject] checked={done}/{total} kept={len(kept)} ({pct}%)", end="", flush=True)
+            if need and len(kept) >= need:
+                pending.clear()
+                break
+        while len(pending) < parallel:
+            more = await schedule_next()
+            if not more:
+                break
+    print()  # newline
+
+    return kept
 
 async def ingest_by_coverage(
     *,
@@ -890,51 +1036,62 @@ async def ingest_by_coverage(
     """
     Discover tables that satisfy the coverage expression and ingest them.
 
-    Fixes:
-      - Probes are bounded (no huge gather).
-      - Early-stop probing once we have enough matches.
-      - Per-table probe timeout.
-      - Progress ticks so it doesn't look frozen.
+    - Catalog fetch pruned by mentioned levels (cheap).
+    - Optional text narrowing on survey (cheap).
+    - Optional subject narrowing that falls back to metadata (bounded + early stop).
+    - Coverage probe (bounded + early stop).
     """
     ensure_full_schema()
     report = BulkReport()
 
-    # Parse coverage and extract hinted levels (e.g., {"N3","N6"})
+    # Parse coverage and extract hinted levels
     try:
         cov_ast = parse_coverage_expr(coverage)
     except Exception as exc:
         raise RuntimeError(f"Invalid --coverage expression: {coverage!r}: {exc}") from exc
     level_hints = extract_levels(cov_ast)
 
-    # How many matches we actually need to keep
     need = max(0, int(limit)) if (limit is not None and limit >= 0) else None
     par_probe = max(1, int(probe_concurrent or concurrency))
 
     async with SidraApiClient() as client:
-        # 1) Catalog fetch with hinted levels (cheap server-side pruning)
+        # 1) Catalog fetch with hinted levels (server-side pruning)
         entries = await fetch_catalog_entries(client=client, levels=sorted(level_hints) or None)
 
-        # 2) Optional subject/survey narrowing (kept)
+        # 2) Survey narrowing (accent-insensitive, already implemented in filter_catalog_entries)
         entries = filter_catalog_entries(
             entries,
             require_any_levels=None,
             require_all_levels=None,
             exclude_levels=None,
-            subject_contains=subject_contains,
+            subject_contains=None,           # handled below via metadata fallback
             survey_contains=survey_contains,
         )
-
-        total = len(entries)
-        if total == 0:
+        if not entries:
             return report
 
+        # 3) Subject narrowing with metadata fallback (bounded, early-stop)
+        if subject_contains:
+            # probe a bit more than 'need' so the coverage step still has room to filter
+            subj_need = need if need is not None else None
+            entries = await _subject_gate_with_metadata(
+                entries=entries,
+                subject_contains=subject_contains,
+                client=client,
+                need=subj_need,
+                parallel=par_probe,
+            )
+            if not entries:
+                return report
+
+        total = len(entries)
         print(f"[probe] candidates={total}, levels={sorted(level_hints) or []}, parallel={par_probe}")
 
+        # 4) Coverage probe (bounded, early-stop)
         kept: list[CatalogEntry] = []
         pending: set[asyncio.Task] = set()
         it = iter(entries)
 
-        # Helper: schedule next probe task (skips tables that don't claim needed levels)
         async def schedule_next() -> bool:
             try:
                 e = next(it)
@@ -942,10 +1099,9 @@ async def ingest_by_coverage(
                 return False
             check_levels = (level_hints & e.level_codes) if level_hints else set()
             if not check_levels:
-                return True  # nothing to probe for this one; move on
+                return True
 
             async def _one(e_: CatalogEntry) -> tuple[CatalogEntry, bool]:
-                # Hard timeout per table to avoid indefinite stalls
                 per_table_timeout = max(10.0, 2.0 * float(get_settings().request_timeout))
                 try:
                     counts = await asyncio.wait_for(
@@ -961,13 +1117,11 @@ async def ingest_by_coverage(
             pending.add(t)
             return True
 
-        # Prime the initial probe window
         for _ in range(par_probe):
             if not await schedule_next():
                 break
 
         probed = 0
-        # Drain as tasks complete; keep backfilling to maintain parallelism; early stop when enough kept
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for t in done:
@@ -975,29 +1129,24 @@ async def ingest_by_coverage(
                 e, ok = await t
                 if ok:
                     kept.append(e)
-
-                # progress tick every 10 completes, or when we hit the target
                 if (probed % 10 == 0) or (need and len(kept) >= need):
                     pct = (probed * 100) // max(1, total)
                     print(f"\r[probe] probed={probed}/{total} kept={len(kept)} ({pct}%)", end="", flush=True)
-
                 if need and len(kept) >= need:
                     pending.clear()
                     break
-
-                while len(pending) < par_probe:
-                    more = await schedule_next()
-                    if not more:
-                        break
+            while len(pending) < par_probe:
+                more = await schedule_next()
+                if not more:
+                    break
 
         print()  # newline after progress
 
-        # 3) Cap to limit (if any) and record discovery
         if need is not None:
             kept = kept[:need]
         report.discovered_ids = [e.id for e in kept]
 
-        # 4) Skip already ingested
+        # 5) Skip existing + ingest
         with sqlite_session() as conn:
             existing = {int(r[0]) for r in conn.execute("SELECT id FROM agregados")}
         to_do = [e.id for e in kept if e.id not in existing]
@@ -1007,7 +1156,6 @@ async def ingest_by_coverage(
         if not to_do:
             return report
 
-        # 5) Ingest concurrently (bounded)
         print(f"[ingest] {len(to_do)} tables (parallel={concurrency})")
         sem = asyncio.Semaphore(max(1, concurrency))
 
@@ -1024,7 +1172,6 @@ async def ingest_by_coverage(
         await asyncio.gather(*(worker(t) for t in to_do))
 
     return report
-
 
 
 
@@ -1870,7 +2017,7 @@ def _build() -> None:
         conn.close()
 
 
-def _rf_score(a: str, b: str) -> float:
+def _rf_score(a: str, b: str, **kwargs) -> float:
     """
     Blend a few RapidFuzz scorers (all 0..100) to cover:
       - substrings (partial_ratio),
@@ -1894,9 +2041,6 @@ def similar_keys(
     threshold: float,
     top_k: int = 10,
 ) -> List[Tuple[str, float]]:
-    """
-    Return [(normalized_key, score in 0..1)] of the best matches for the given kind.
-    """
     assert kind in ("var", "class")
     _build()
 
@@ -1908,31 +2052,62 @@ def similar_keys(
     if not choices:
         return []
 
-    # Use RapidFuzz's indexer for speed and quality, with our blended scorer.
-    # We over-fetch (×5) then cut to top_k after filtering by threshold.
+    # Adaptive threshold: for short one-token queries (e.g., "pessoal"),
+    # allow a bit more fuzz so it can hit "pessoas", etc.
+    tok_count = len(q.split())
+    qlen = len(q.replace(" ", ""))
+    eff_th = float(threshold)
+    if tok_count == 1 and qlen <= 8:
+        eff_th = min(eff_th, 0.72)  # relax to 0.72 if default is higher
+    cutoff = max(0, min(100, int(round(eff_th * 100.0))))
+
+
+    # Pass 1 — strict (user cutoff)
     results = process.extract(
-        q,
-        choices,
-        scorer=_rf_score,
-        limit=max(10, top_k * 5),
-        score_cutoff=max(0.0, min(100.0, threshold * 100.0)),
+        q, choices, scorer=_rf_score, limit=max(10, top_k * 5), score_cutoff=cutoff
     )
+
+    # Pass 2 — if empty, slightly relax (−12 pts ~ 0.12)
+    if not results and len(q) <= 10:
+        results = process.extract(
+            q, choices, scorer=_rf_score, limit=max(10, top_k * 5), score_cutoff=max(0, cutoff - 12)
+        )
+        
+    # Pass 2.5 — single-token: compare the query against individual tokens in each key.
+    # This pulls in long names containing a near-match token (e.g., "pessoas" vs "pessoal").
+    if not results and tok_count == 1:
+        hits = []
+        for key in choices:
+            tokens = key.replace("-", " ").split()
+            best = 0
+            for t in tokens:
+                s = fuzz.ratio(q, t)
+                if s > best:
+                    best = s
+                if best >= 86:  # short-circuit when very close
+                    break
+            # tolerate near misses like "pessoal"↔"pessoas"
+            if best >= max(68, cutoff - 15):
+                hits.append((key, best))
+        hits.sort(key=lambda x: x[1], reverse=True)
+        results = [(k, s, None) for (k, s) in hits[: max(10, top_k * 5)]]
+
+
+    # Pass 3 — if still empty, try a robust single scorer (WRatio), no cutoff
+    if not results:
+        results = process.extract(
+            q, choices, scorer=fuzz.WRatio, limit=max(10, top_k * 5)
+        )
+        
 
     out: List[Tuple[str, float]] = [(key, float(score) / 100.0) for (key, score, _idx) in results]
 
-    # Safe fallback: if nothing matched (e.g., extremely short queries with strict threshold),
-    # return simple substring-contains candidates ranked by relative length.
+    # Last resort — exact substring if still nothing
     if not out:
-        rel = []
-        for key in choices:
-            if q in key:
-                # Favor tighter matches
-                rel_score = len(q) / max(1, len(key))
-                rel.append((key, rel_score))
+        rel = [(key, len(q) / max(1, len(key))) for key in choices if q in key]
         rel.sort(key=lambda x: x[1], reverse=True)
         out = rel[:top_k]
 
-    # Final cut to top_k
     return out[:top_k]
 
 
@@ -2012,6 +2187,7 @@ class SearchArgs:
     var_th: float
     class_th: float
     semantic: bool    # use embeddings for titles
+    debug_fuzzy: bool  # NEW
 
 
 def _split_class(spec: str) -> Tuple[str, Optional[str]]:
@@ -2128,6 +2304,15 @@ async def search_tables(
             class_exact.append(ck_exact or "")
             class_cat_per_group.append(catk)
 
+        # ---------- Inspect fuzzy expansions (debug) ----------
+        if args.debug_fuzzy:
+            top_vars = sorted(var_cand_score.items(), key=lambda x: x[1], reverse=True)[:12]
+            print("[fuzzy] var:", ", ".join(f"{k}:{s:.2f}" for k,s in top_vars) or "(none)")
+            for i, grp in enumerate(class_groups):
+                top_cls = sorted(grp.items(), key=lambda x: x[1], reverse=True)[:12]
+                print(f"[fuzzy] class[{i}]:", ", ".join(f"{k}:{s:.2f}" for k,s in top_cls) or "(none)")
+
+
         # ---------- Initial candidate tables ----------
         candidates: Optional[Set[int]] = None
 
@@ -2136,9 +2321,19 @@ async def search_tables(
             ids = _union_tables_for_keys(conn, "link_var", "var_key", var_cand_score.keys())
             candidates = ids if candidates is None else (candidates & ids)
 
+            # Intersect early with class presence if classes were requested
+            if class_groups:
+                groups_sets = [set(g.keys()) for g in class_groups if g]
+                if groups_sets:
+                    cls_ids = _intersect_groups_union_inside(conn, "link_class", "class_key", groups_sets)
+                    candidates = candidates & cls_ids
+                    if not candidates:
+                        return []
+
+                
         # If classes-only: intersect across groups (union inside)
         if not var_cand_score and class_groups:
-            groups_sets = [set(g) for g in class_groups]
+            groups_sets = [set(g.keys()) for g in class_groups if g]
             ids = _intersect_groups_union_inside(conn, "link_class", "class_key", groups_sets)
             candidates = ids if candidates is None else (candidates & ids)
 
@@ -2405,6 +2600,107 @@ from typing import Mapping, Dict
 
 def rrf(ranks: Mapping[int, int], k: float = 60.0) -> Dict[int, float]:
     return {k_: 1.0 / (k + r) for k_, r in ranks.items()}
+
+
+
+###############################################################################
+### FILE: smoke.sh
+###############################################################################
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "== sanity: pick DB in repo root =="
+export SIDRA_DATABASE_PATH="$(pwd)/sidra.db"
+python -m sidra_search.cli db stats
+
+echo
+echo "== A) subject/survey filters =="
+python -m sidra_search.cli ingest-coverage \
+  --coverage "N3 OR (N6>=5000)" \
+  --survey-contains "Censo" \
+  --subject-contains "Agro" \
+  --limit 10
+
+python -m sidra_search.cli ingest-coverage \
+  --coverage "N3 OR (N6>=5000)" \
+  --survey-contains "Censo" \
+  --limit 10
+
+echo
+echo "== B) link counts after ingest (should be nonzero) =="
+python -m sidra_search.cli build-links --all
+python -m sidra_search.cli db stats
+sqlite3 "$SIDRA_DATABASE_PATH" "SELECT COUNT(*) FROM link_var;"
+sqlite3 "$SIDRA_DATABASE_PATH" "SELECT COUNT(*) FROM link_class;"
+sqlite3 "$SIDRA_DATABASE_PATH" "SELECT COUNT(*) FROM link_var_class;"
+
+echo
+echo "== C) verify known var×class pairs exist at SQL level =="
+sqlite3 "$SIDRA_DATABASE_PATH" "
+SELECT DISTINCT table_id
+FROM link_var_class
+WHERE var_key LIKE '%pessoas%' AND class_key='sexo';"
+
+sqlite3 "$SIDRA_DATABASE_PATH" "
+SELECT DISTINCT table_id
+FROM link_var_class
+WHERE var_key LIKE '%pessoas%' AND var_key LIKE '%indigen%'
+  AND class_key LIKE '%ensino%';"
+
+echo
+echo "== D) search: single-token typo should succeed (token-level merge) =="
+python -m sidra_search.cli search --var "pessoal" --class "sexo" --limit 10 --explain --debug-fuzzy
+
+echo
+echo "== E) search: multi-token misspelling still ok (via blended scorer) =="
+python -m sidra_search.cli search --var "pssoas" --class "sexo" --limit 10 --explain --debug-fuzzy
+
+echo
+echo "== F) search: classes-only should work (no crash) =="
+python -m sidra_search.cli search --class "sexo" --limit 10 --explain
+
+echo
+echo "== G) search: Class:Category strict filter =="
+# Try common category 'Branca' under 'Cor ou raça' (if present in your ingest)
+python -m sidra_search.cli search --class "Cor ou raça:Branca" --limit 10 --explain || true
+
+echo
+echo "== H) title FTS (lexical) =="
+python -m sidra_search.cli search --title "frequencia escolar indígenas" --limit 10 --explain
+
+echo
+echo "== I) coverage filter on search results (should only show N6 >= 5000) =="
+python -m sidra_search.cli search \
+  --var "pessoas" --class "sexo" \
+  --coverage "(N6>=5000)" \
+  --limit 10 --explain
+
+echo
+echo "== J) debug mismatch drill: show top fuzzy keys directly =="
+# Ensure we actually see 'pessoas' among var fuzzy candidates for 'pessoal'
+python -m sidra_search.cli search --var "pessoal" --limit 3 --debug-fuzzy
+
+echo
+echo "== K) negative test: impossible coverage expression -> handled error =="
+set +e
+python -m sidra_search.cli ingest-coverage --coverage "N6>>=5" --limit 1 2>&1 | sed -n '1,5p'
+set -e
+
+echo
+echo "== L) FTS row per table guaranteed =="
+sqlite3 "$SIDRA_DATABASE_PATH" "SELECT COUNT(*), COUNT(DISTINCT table_id) FROM table_titles_fts;"
+
+echo
+echo "== M) pairing sanity: pick a returned table and show its classes =="
+# Replace 10058 with any ID from earlier results:
+sqlite3 "$SIDRA_DATABASE_PATH" "SELECT DISTINCT class_key FROM link_class WHERE table_id=10058 ORDER BY 1 LIMIT 20;"
+
+echo
+echo "== All tests ran. Scan the outputs above for: =="
+echo "  - No 'No results.' where a pair exists in SQL"
+echo "  - Fuzzy lists for 'pessoal' include at least one 'pessoas ...' key"
+echo "  - Class-only search prints results (no TypeError)"
+echo "  - Coverage-constrained search shows N6 >= 5000 in lines"
 
 
 
