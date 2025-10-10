@@ -2,26 +2,78 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
-from dataclasses import asdict
-from typing import Sequence  # <- added
-from array import array
-import orjson
 import hashlib
+import json
+import sys
+from array import array
+from dataclasses import asdict
+from typing import Sequence
+
+import orjson
 
 from ..config import get_settings
 from ..db.session import ensure_full_schema, sqlite_session
-from ..ingest.ingest_table import ingest_table
 from ..ingest.bulk import ingest_by_coverage
+from ..ingest.ingest_table import _canonical_table_text  # reuse identical text
+from ..ingest.ingest_table import ingest_table
 from ..ingest.links import build_links_for_table
 from ..net.embedding_client import EmbeddingClient
-from ..search.tables import SearchArgs, search_tables
 from ..search.fuzzy3gram import reset_cache
-from ..db.session import sqlite_session
-from ..ingest.ingest_table import _canonical_table_text  # reuse identical text
+from ..search.tables import SearchArgs, search_tables
+from ..search.where_expr import parse_where_expr
+
+
+CLI_MANUAL = """\
+sidra-search manual
+====================
+
+Common commands:
+  python -m sidra_search.cli db migrate
+      Ensure both base and search schemas are present in the local SQLite database.
+
+  python -m sidra_search.cli ingest-coverage --coverage "N3 OR (N6>=5000)" --limit 10
+      Discover tables that satisfy a coverage expression (boolean logic over N-level counts),
+      probing SIDRA as needed, and ingest them locally. Combine with --survey-contains or
+      --subject-contains to narrow the catalog textually.
+
+  python -m sidra_search.cli build-links --all
+      Rebuild search link tables (variables, classifications, categories) for every ingested table.
+
+  python -m sidra_search.cli embed-titles --only-missing
+      Refresh semantic embeddings for table titles. Required before using --semantic search.
+
+  python -m sidra_search.cli search --q 'title~"taxa" AND (N6>=5000)'
+      Search with the unified boolean query language (facets + coverage). Combine with --semantic
+      to blend embeddings with lexical and structural ranking when TITLE literals are present.
+      SURVEY and SUBJECT terms act as catalog filters only. For categories, use cat~"Nome" to
+      match any class containing that category, or cat~"Class::Nome" to require the exact
+      class/category pair. "Contains" (~) checks use normalized, accent-stripped substring
+      comparisons, while internal prefilters on VAR/CLASS/CAT link keys stay exact for precision.
+      Add --explain to show match reasons.
+
+Legacy flags like --title/--var/--class/--coverage are still accepted but translate into --q behind the scenes.
+
+Flags worth noting:
+  --json            Output structured JSON for scripting.
+  --debug-fuzzy     Inspect fuzzy expansions for variables/classes during search.
+  --no-fuzzy        Disable fuzzy expansions (exact key matching only).
+
+Environment hints:
+  SIDRA_SEARCH_ENABLE_TITLE_EMBEDDINGS=1 enables semantic title ranking once embeddings exist.
+  SIDRA_DATABASE_PATH can be set to relocate the SQLite database file.
+
+Run `python -m sidra_search.cli <command> --help` for command-specific options.
+"""
 
 def _print_json(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2))
+
+
+# ---------------------------
+# Manual / help
+# ---------------------------
+def _cmd_manual(_args: argparse.Namespace) -> None:
+    print(CLI_MANUAL)
 
 
 # ---------------------------
@@ -121,13 +173,62 @@ def _cmd_build_links(args: argparse.Namespace) -> None:
 # ---------------------------
 # Search
 # ---------------------------
+def _quote_literal(text: str) -> str:
+    return text.replace("\\", "\\\\").replace('"', "\\\"")
+
+
+def _legacy_query(args: argparse.Namespace) -> str | None:
+    parts: list[str] = []
+    if args.title:
+        parts.append(f'title~"{_quote_literal(args.title)}"')
+    for v in args.var or ():
+        parts.append(f'var~"{_quote_literal(v)}"')
+    for spec in args.cls or ():
+        raw = spec.strip()
+        if not raw:
+            continue
+        if ":" in raw:
+            class_part, cat_part = raw.split(":", 1)
+            class_part = class_part.strip()
+            cat_part = cat_part.strip()
+        else:
+            class_part, cat_part = raw, ""
+        if class_part:
+            parts.append(f'class~"{_quote_literal(class_part)}"')
+        if class_part and cat_part:
+            combo = f"{class_part}::{cat_part}"
+            parts.append(f'cat~"{_quote_literal(combo)}"')
+    if args.coverage:
+        parts.append(f"({args.coverage})")
+    if args.survey_contains:
+        parts.append(f'survey~"{_quote_literal(args.survey_contains)}"')
+    if args.subject_contains:
+        parts.append(f'subject~"{_quote_literal(args.subject_contains)}"')
+    if parts:
+        return " AND ".join(parts)
+    return None
+
+
 def _cmd_search_tables(args: argparse.Namespace) -> None:
     ensure_full_schema()
+
+    q_expr = args.q.strip() if args.q and args.q.strip() else None
+    legacy_expr = _legacy_query(args)
+    if legacy_expr:
+        print("NOTE: --title/--var/--class/--coverage flags are deprecated; use --q instead.")
+        q_expr = f"({q_expr}) AND ({legacy_expr})" if q_expr else legacy_expr
+
+    where = None
+    if q_expr:
+        try:
+            where = parse_where_expr(q_expr)
+        except Exception as exc:  # pragma: no cover - user input error
+            print(f"invalid query (--q): {exc}")
+            sys.exit(1)
+
     sargs = SearchArgs(
-        title=args.title,
-        vars=tuple(args.var or ()),
-        classes=tuple(args.cls or ()),
-        coverage=args.coverage,
+        q=q_expr,
+        where=where,
         limit=max(1, args.limit),
         allow_fuzzy=not args.no_fuzzy,
         var_th=float(args.var_th),
@@ -135,6 +236,7 @@ def _cmd_search_tables(args: argparse.Namespace) -> None:
         semantic=bool(args.semantic),
         debug_fuzzy=bool(args.debug_fuzzy),
     )
+
     emb = EmbeddingClient() if args.semantic else None
     hits = asyncio.run(search_tables(sargs, embedding_client=emb))
     if args.json:
@@ -274,6 +376,7 @@ def _cmd_embed_titles(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sidra-search", description="Table-centric search & ingestion")
+    p.add_argument("--manual", action="store_true", help="Print a concise CLI usage guide and exit")
     sub = p.add_subparsers(dest="cmd")
 
     # db
@@ -308,11 +411,43 @@ def build_parser() -> argparse.ArgumentParser:
     bl.set_defaults(func=_cmd_build_links)
 
     # search
-    st = sub.add_parser("search", help="Search tables by facets and title")
-    st.add_argument("--title", dest="title", help="free-text title query")
-    st.add_argument("--var", dest="var", action="append", help="variable name (repeatable)")
-    st.add_argument("--class", dest="cls", action="append", help='class name or "Class:Category" (repeatable)')
-    st.add_argument("--coverage", help="boolean coverage expr, e.g. '(N6>=5000) AND (N3>=27)'")
+    st = sub.add_parser("search", help="Search tables with unified boolean queries")
+    st.add_argument(
+        "--q",
+        dest="q",
+        help="Unified boolean query (e.g. 'title~\"taxa\" AND (N6>=5000)')",
+    )
+    st.add_argument(
+        "--title",
+        dest="title",
+        help='[deprecated] Title filter; prefer --q \'title~"..."\'',
+    )
+    st.add_argument(
+        "--survey-contains",
+        dest="survey_contains",
+        help="[deprecated] Survey substring filter; use --q",
+    )
+    st.add_argument(
+        "--subject-contains",
+        dest="subject_contains",
+        help="[deprecated] Subject substring filter; use --q",
+    )
+    st.add_argument(
+        "--var",
+        dest="var",
+        action="append",
+        help="[deprecated] Variable name (repeatable); use --q",
+    )
+    st.add_argument(
+        "--class",
+        dest="cls",
+        action="append",
+        help="[deprecated] Class or 'Class:Category' (repeatable); use --q",
+    )
+    st.add_argument(
+        "--coverage",
+        help="[deprecated] Coverage expression; include directly in --q",
+    )
     st.add_argument("--limit", type=int, default=20)
     st.add_argument("--no-fuzzy", action="store_true")
     st.add_argument("--var-th", type=float, default=0.74)
@@ -336,6 +471,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
+
+    if getattr(args, "manual", False):
+        _cmd_manual(args)
+        return
 
     # Support nested: "db migrate"/"db stats"
     if getattr(args, "cmd", None) == "db" and not hasattr(args, "func"):
