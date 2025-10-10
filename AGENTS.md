@@ -389,7 +389,7 @@ python -m sidra_search.cli build-links --all
 **Search (lexical only)**
 
 ```bash
-python -m sidra_search.cli search -t "frequência escolar indígena" --limit 10 --explain
+python -m sidra_search.cli search --q 'title~"frequência escolar indígena"' --limit 10 --explain
 ```
 
 **Enable semantic**
@@ -398,7 +398,7 @@ python -m sidra_search.cli search -t "frequência escolar indígena" --limit 10 
 # Start LM Studio (serving /v1/embeddings), then:
 export SIDRA_SEARCH_ENABLE_TITLE_EMBEDDINGS=1
 python -m sidra_search.cli embed-titles --only-missing
-python -m sidra_search.cli search -t "tabela sobre sexo" --semantic --limit 10
+python -m sidra_search.cli search --q 'title~"tabela sobre sexo"' --semantic --limit 10
 ```
 
 ---
@@ -410,6 +410,18 @@ python -m sidra_search.cli search -t "tabela sobre sexo" --semantic --limit 10
 * **Permanent 500s** (e.g., certain tables) will stay in `failed`. Re-runs will not re-ingest them unless the API starts serving them again; they will appear in discovery but be skipped as “existing/failed”.
 * **FTS**: ensure a row is inserted per table (ingestion does this); otherwise lexical title search won’t surface that table.
 * **Embeddings off**: `--semantic` has no effect without embeddings populated.
+* Use `python -m sidra_search.cli --manual` for a quick CLI refresher. When semantic ranking
+  is requested but prerequisites are missing, the CLI now prints diagnostics instead of
+  silently falling back to lexical-only results.
+* **Unified query flag**: prefer `search --q '<expr>'` for all filters. Legacy `--title/--var/--class/--coverage`
+  flags still work for now but only as a translation shim.
+* **Text matching semantics**: `~` checks compare normalized, accent-stripped substrings. Internal
+  prefilters on VAR/CLASS/CAT link keys stay exact for precision; the boolean AST still enforces
+  the user-visible contains logic.
+* **Facet semantics**: `TITLE` literals power lexical/semantic ranking; `SURVEY`/`SUBJECT`
+  literals filter the catalog only. When both VAR and CLASS clauses are present, matches
+  reflect actual `link_var_class` pairs, and `cat~"Class::Category"` requires the exact
+  class/category combination.
 
 ---
 
