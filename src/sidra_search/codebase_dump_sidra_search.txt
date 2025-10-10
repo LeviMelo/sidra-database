@@ -47,8 +47,8 @@ __all__ = [
 ###############################################################################
 ### FILE: __main__.py
 ###############################################################################
-from . import main
-
+# sidra_search/__main__.py
+from .cli import main
 if __name__ == "__main__":
     main()
 
@@ -64,7 +64,11 @@ import asyncio
 import json
 from dataclasses import asdict
 from typing import Sequence  # <- added
+from array import array
+import orjson
+import hashlib
 
+from ..config import get_settings
 from ..db.session import ensure_full_schema, sqlite_session
 from ..ingest.ingest_table import ingest_table
 from ..ingest.bulk import ingest_by_coverage
@@ -73,6 +77,7 @@ from ..net.embedding_client import EmbeddingClient
 from ..search.tables import SearchArgs, search_tables
 from ..search.fuzzy3gram import reset_cache
 from ..db.session import sqlite_session
+from ..ingest.ingest_table import _canonical_table_text  # reuse identical text
 
 def _print_json(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2))
@@ -234,6 +239,98 @@ def _cmd_search_tables(args: argparse.Namespace) -> None:
                 print(f"  score={h.score:.3f} (struct={h.struct_score:.3f}, rrf={h.rrf_score:.3f})")
 
 
+# ---------------------------
+# Embed
+# ---------------------------
+
+def _vec_to_blob(vec):
+    arr = array("f", (float(x) for x in vec))
+    return arr.tobytes()
+
+def _sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def _cmd_embed_titles(args: argparse.Namespace) -> None:
+    ensure_full_schema()
+    s = get_settings()
+    model = args.model or s.embedding_model
+    only_missing = bool(args.only_missing)
+    limit = args.limit if args.limit and args.limit > 0 else None
+
+    emb = EmbeddingClient()
+
+    # Iterate agregados and upsert embeddings if missing/stale
+    with sqlite_session() as conn:
+        rows = conn.execute(
+            "SELECT id, raw_json FROM agregados ORDER BY id"
+        ).fetchall()
+
+    count = 0
+    updated = 0
+    for r in rows:
+        if limit is not None and count >= limit:
+            break
+        tid = int(r["id"])
+        try:
+            md = orjson.loads(r["raw_json"])
+        except Exception:
+            continue
+
+        text = _canonical_table_text(md)
+        if not text.strip():
+            continue
+
+        text_hash = _sha256_text(text)
+
+        # Check existing
+        with sqlite_session() as conn:
+            cur = conn.execute(
+                "SELECT text_hash FROM embeddings WHERE entity_type='agregado' AND entity_id=? AND model=?",
+                (str(tid), model),
+            ).fetchone()
+            existing_hash = cur["text_hash"] if cur else None
+
+        if existing_hash == text_hash:
+            count += 1
+            continue
+        if only_missing and existing_hash is not None:
+            count += 1
+            continue
+
+        # Compute vector
+        try:
+            vec = emb.embed_text(text, model=model)
+        except Exception as exc:
+            print(f"embed failed for {tid}: {exc}")
+            count += 1
+            continue
+
+        # Upsert
+        with sqlite_session() as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO embeddings(
+                      entity_type, entity_id, agregado_id, text_hash, model, dimension, vector, created_at
+                    ) VALUES(?,?,?,?,?,?,?,datetime('now'))
+                    """,
+                    (
+                        "agregado",
+                        str(tid),
+                        tid,
+                        text_hash,
+                        model,
+                        len(vec),
+                        _vec_to_blob(vec),
+                    ),
+                )
+        updated += 1
+        count += 1
+
+    print(f"embed-titles: scanned={count}, updated={updated}, model={model}")
+
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sidra-search", description="Table-centric search & ingestion")
     sub = p.add_subparsers(dest="cmd")
@@ -282,11 +379,18 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--semantic", action="store_true", help="use semantic title ranking (requires embeddings)")
     st.add_argument("--explain", action="store_true", help="print match rationale and scores")
     st.add_argument("--json", action="store_true")
-    st.set_defaults(func=_cmd_search_tables)
     st.add_argument("--show-classes", action="store_true", help="List up to 3 classification names for each hit")
     st.add_argument("--debug-fuzzy", action="store_true", help="Print fuzzy expansions and candidate counts")
-    return p
+    st.set_defaults(func=_cmd_search_tables)
 
+    # embeddings backfill (ADD BEFORE RETURN)
+    et = sub.add_parser("embed-titles", help="(Re)embed table titles (idempotent)")
+    et.add_argument("--model", help="Embedding model name (defaults to settings)")
+    et.add_argument("--only-missing", action="store_true", help="Skip rows that already have an embedding, even if text changed")
+    et.add_argument("--limit", type=int, default=None, help="Limit number of tables processed")
+    et.set_defaults(func=_cmd_embed_titles)
+
+    return p
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
@@ -719,10 +823,23 @@ def create_connection() -> sqlite3.Connection:
         check_same_thread=False,
     )
     conn.row_factory = sqlite3.Row
+
+    # Safety + performance (no semantic change):
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA synchronous=NORMAL")  # durable enough, already in code
     conn.execute(f"PRAGMA busy_timeout = {int(max(s.database_timeout, 60.0) * 1000)}")
+
+    # Added: speed up big batch inserts & temp btrees
+    # cache_size: negative => value is in KiB (here ~128 MiB)
+    conn.execute("PRAGMA cache_size = -131072")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    # Use mmap when supported (safe fallback if OS/FS refuses)
+    try:
+        conn.execute("PRAGMA mmap_size = 268435456")  # 256 MiB
+    except Exception:
+        pass
+
     return conn
 
 
@@ -911,23 +1028,50 @@ async def _probe_counts_for_levels(
     client: SidraApiClient,
     table_id: int,
     levels: Iterable[str],
-) -> dict[str, int]:
+) -> tuple[dict[str, int], dict[str, list]]:
     """
-    Fetch locality lists per level for a table and return {LEVEL: count}.
-    Levels are normalized to UPPERCASE strings. Non-list responses count as 0.
+    Fetch locality lists per level for a table and return:
+      - counts: {LEVEL: count}
+      - payloads: {LEVEL: list_of_localities}  (for reuse during ingest)
+    Levels are normalized to UPPERCASE strings. Non-list responses are treated as empty lists.
     """
-    counts: dict[str, int] = {}
-    for lvl in {str(l).upper() for l in levels if l}:
+    lvls = sorted({str(l).upper() for l in levels if l})
+    if not lvls:
+        return {}, {}
+
+    async def one(lvl: str) -> tuple[str, list]:
         try:
             payload = await client.fetch_localities(table_id, lvl)
             if isinstance(payload, list):
-                counts[lvl] = len(payload)
-            else:
-                # defensive: sometimes API oddities; treat non-list as 0
-                counts[lvl] = 0
+                return (lvl, payload)
+            try:
+                return (lvl, list(payload))
+            except Exception:
+                return (lvl, [])
         except Exception:
-            counts[lvl] = 0
-    return counts
+            return (lvl, [])
+
+    results = await asyncio.gather(*(one(l) for l in lvls))
+    payloads: dict[str, list] = {k: v for (k, v) in results}
+    counts: dict[str, int] = {k: (len(v) if isinstance(v, list) else 0) for k, v in payloads.items()}
+    return counts, payloads
+
+
+# Use local DB counts (agregados_levels) for specific levels, if present
+def _db_counts_for_levels(table_id: int, levels: Iterable[str]) -> dict[str, int]:
+    lvls = [str(l).upper() for l in levels if l]
+    if not lvls:
+        return {}
+    with sqlite_session() as conn:
+        placeholders = ",".join("?" for _ in lvls)
+        sql = (
+            f"SELECT level_id, COALESCE(locality_count,0) AS c "
+            f"FROM agregados_levels "
+            f"WHERE agregado_id=? AND UPPER(level_id) IN ({placeholders})"
+        )
+        rows = conn.execute(sql, (table_id, *lvls)).fetchall()
+    return {str(r["level_id"]).upper(): int(r["c"]) for r in rows}
+
 
 async def _subject_gate_with_metadata(
     *,
@@ -1024,6 +1168,7 @@ async def _subject_gate_with_metadata(
 
     return kept
 
+
 async def ingest_by_coverage(
     *,
     coverage: str,
@@ -1043,6 +1188,9 @@ async def ingest_by_coverage(
     """
     ensure_full_schema()
     report = BulkReport()
+    
+    # Cache per-table locality payloads for levels we probed (e.g., N3/N6)
+    prefetched_localities: dict[int, dict[str, list]] = {}
 
     # Parse coverage and extract hinted levels
     try:
@@ -1097,26 +1245,42 @@ async def ingest_by_coverage(
                 e = next(it)
             except StopIteration:
                 return False
+
             check_levels = (level_hints & e.level_codes) if level_hints else set()
             if not check_levels:
+                # Nothing to check for this table per coverage expression → accept (no network)
+                async def _one_accept():
+                    return (e, True, {})
+                pending.add(asyncio.create_task(_one_accept()))
                 return True
 
-            async def _one(e_: CatalogEntry) -> tuple[CatalogEntry, bool]:
+            # 1) Try local DB counts first (only if table already ingested)
+            db_counts = await asyncio.to_thread(_db_counts_for_levels, e.id, check_levels)
+            have_all = bool(db_counts) and all(l.upper() in db_counts for l in check_levels)
+            if have_all:
+                ok_local = eval_coverage(cov_ast, db_counts)
+                async def _one_db():
+                    return (e, ok_local, {})
+                pending.add(asyncio.create_task(_one_db()))
+                return True
+
+            # 2) Fallback: live probe from API (also returns payloads we can reuse)
+            async def _one_net(e_: CatalogEntry) -> tuple[CatalogEntry, bool, dict[str, list]]:
                 per_table_timeout = max(10.0, 2.0 * float(get_settings().request_timeout))
                 try:
-                    counts = await asyncio.wait_for(
+                    counts, payloads = await asyncio.wait_for(
                         _probe_counts_for_levels(client, e_.id, check_levels),
                         timeout=per_table_timeout,
                     )
                     ok = eval_coverage(cov_ast, counts)
-                    return e_, ok
+                    return e_, ok, (payloads if ok else {})
                 except Exception:
-                    return e_, False
+                    return e_, False, {}
 
-            t = asyncio.create_task(_one(e))
-            pending.add(t)
+            pending.add(asyncio.create_task(_one_net(e)))
             return True
 
+        # prime
         for _ in range(par_probe):
             if not await schedule_next():
                 break
@@ -1126,15 +1290,23 @@ async def ingest_by_coverage(
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for t in done:
                 probed += 1
-                e, ok = await t
+                e, ok, payloads = await t
                 if ok:
                     kept.append(e)
+                    if payloads:
+                        prefetched_localities[e.id] = payloads
                 if (probed % 10 == 0) or (need and len(kept) >= need):
                     pct = (probed * 100) // max(1, total)
-                    print(f"\r[probe] probed={probed}/{total} kept={len(kept)} ({pct}%)", end="", flush=True)
+                    inflight = len(pending)
+                    print(
+                        f"\r[probe] done={probed}/{total} (accepted={len(kept)} • {pct}%) | inflight={inflight}",
+                        end="",
+                        flush=True,
+                    )
                 if need and len(kept) >= need:
                     pending.clear()
                     break
+
             while len(pending) < par_probe:
                 more = await schedule_next()
                 if not more:
@@ -1146,10 +1318,23 @@ async def ingest_by_coverage(
             kept = kept[:need]
         report.discovered_ids = [e.id for e in kept]
 
-        # 5) Skip existing + ingest
+        # 5) Skip existing + ingest (+ include historical failures)
         with sqlite_session() as conn:
             existing = {int(r[0]) for r in conn.execute("SELECT id FROM agregados")}
-        to_do = [e.id for e in kept if e.id not in existing]
+            past_failed = {
+                int(r[0])
+                for r in conn.execute(
+                    "SELECT DISTINCT agregado_id FROM ingestion_log WHERE status='error'"
+                )
+            }
+
+        # schedule = new-kept (not existing)  ∪  (historical failures not existing)
+        new_kept = [e.id for e in kept if e.id not in existing]
+        hist_retry = sorted(past_failed - existing)
+
+        to_do = list(dict.fromkeys([*new_kept, *hist_retry]))  # preserve order, dedupe
+
+        report.discovered_ids = [e.id for e in kept]  # unchanged semantics
         report.scheduled_ids = list(to_do)
         report.skipped_existing = [e.id for e in kept if e.id in existing]
 
@@ -1161,13 +1346,35 @@ async def ingest_by_coverage(
 
         async def worker(tid: int) -> None:
             async with sem:
-                try:
-                    await ingest_table(tid)
-                    report.ingested_ids.append(tid)
-                    print(f"  ingested {tid}")
-                except Exception as exc:
-                    report.failed.append((tid, str(exc)[:200]))
-                    print(f"  failed {tid}: {exc}")
+                # Per-table retry with short backoff (other tasks continue)
+                delays = (1.0, 3.0, 7.0)  # seconds
+                attempt = 0
+                while True:
+                    try:
+                        await ingest_table(tid)
+                        report.ingested_ids.append(tid)
+                        print(f"  ingested {tid}")
+                        return
+                    except Exception as exc:
+                        msg = str(exc)
+                        attempt += 1
+
+                        # Persistent server-side 500? Fail fast after 2 tries.
+                        if "statusCode\":500" in msg or " 500:" in msg:
+                            if attempt >= 2:
+                                report.failed.append((tid, msg[:200]))
+                                print(f"  failed {tid}: {exc} (permanent 500?)")
+                                return
+
+                        if attempt > len(delays):
+                            report.failed.append((tid, msg[:200]))
+                            print(f"  failed {tid}: {exc}")
+                            return
+
+                        backoff = delays[attempt - 1]
+                        print(f"  retry {tid} in {backoff:.0f}s (attempt {attempt+1})")
+                        await asyncio.sleep(backoff)
+
 
         await asyncio.gather(*(worker(t) for t in to_do))
 
@@ -1331,6 +1538,7 @@ async def ingest_table(
     client: SidraApiClient | None = None,
     embedding_client: EmbeddingClient | None = None,
     build_links: bool = True,
+    prefetched_localities: dict[str, list] | None = None,  # optional reuse from probe
 ) -> None:
     """
     Fetch metadata from SIDRA and persist into base + search schemas.
@@ -1370,36 +1578,66 @@ async def ingest_table(
         level_rows: list[tuple[int, str, str | None, str, int]] = []
         locality_rows: list[tuple[int, str, str | None, str | None]] = []
 
-        for level_type, codes in nivel_groups.items():
+        # NOTE:
+        # - `prefetched_localities` is a dict like {"N3": [...], "N6": [...]} if passed by the caller.
+        # - Keys we store/reuse are UPPERCASE to avoid case mismatches.
+        for level_type, codes in (nivel_groups or {}).items():
             if not codes:
                 continue
-            for code in codes:
-                # fetch localities per code
-                try:
-                    payload = await client.fetch_localities(table_id, str(code))
-                except Exception:
-                    payload = []
-                if not isinstance(payload, list):
+            # Be defensive: ensure we can iterate even if API returned a scalar.
+            try:
+                code_list = list(codes)
+            except TypeError:
+                code_list = [codes]
+
+            for code in code_list:
+                code_s = str(code)
+                code_key = code_s.upper()
+
+                # Prefer the probe's cached payload for this level (e.g., N3/N6).
+                payload: list | None = None
+                if prefetched_localities and isinstance(prefetched_localities.get(code_key), list):
+                    payload = prefetched_localities[code_key]
+                else:
                     try:
-                        payload = list(payload)
+                        payload = await client.fetch_localities(table_id, code_s)
                     except Exception:
                         payload = []
+                    if not isinstance(payload, list):
+                        try:
+                            payload = list(payload)
+                        except Exception:
+                            payload = []
 
+                # Count first (coverage uses counts only)
                 count = len(payload)
-                if str(code).upper() == "N6":
+                if code_key == "N6":
                     municipality_count = max(municipality_count, count)
 
+                # Try to extract a representative level_name (same as before)
                 level_name = None
                 if payload:
-                    level_name = (payload[0].get("nivel") or {}).get("nome")
+                    try:
+                        node = payload[0].get("nivel") if isinstance(payload[0], dict) else None
+                        if isinstance(node, dict):
+                            level_name = node.get("nome")
+                    except Exception:
+                        level_name = None
 
-                level_rows.append(
-                    (table_id, str(code), level_name, str(level_type), count)
-                )
-                for loc in payload:
-                    locality_rows.append(
-                        (table_id, str(code), loc.get("id"), loc.get("nome"))
-                    )
+                # Record per-level counts
+                level_rows.append((table_id, code_s, level_name, str(level_type), count))
+
+                # Persist exact membership (unchanged behavior)
+                if payload:
+                    for loc in payload:
+                        if isinstance(loc, dict):
+                            lid = loc.get("id")
+                            lname = loc.get("nome")
+                        else:
+                            lid = None
+                            lname = None
+                        locality_rows.append((table_id, code_s, lid, lname))
+
 
         covers_nat = (
             1

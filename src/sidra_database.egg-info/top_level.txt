@@ -1,2 +1,0 @@
-sidra_database
-sidra_va
