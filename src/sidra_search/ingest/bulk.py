@@ -188,6 +188,23 @@ async def _probe_counts_for_levels(
     counts: dict[str, int] = {k: (len(v) if isinstance(v, list) else 0) for k, v in payloads.items()}
     return counts, payloads
 
+
+# Use local DB counts (agregados_levels) for specific levels, if present
+def _db_counts_for_levels(table_id: int, levels: Iterable[str]) -> dict[str, int]:
+    lvls = [str(l).upper() for l in levels if l]
+    if not lvls:
+        return {}
+    with sqlite_session() as conn:
+        placeholders = ",".join("?" for _ in lvls)
+        sql = (
+            f"SELECT level_id, COALESCE(locality_count,0) AS c "
+            f"FROM agregados_levels "
+            f"WHERE agregado_id=? AND UPPER(level_id) IN ({placeholders})"
+        )
+        rows = conn.execute(sql, (table_id, *lvls)).fetchall()
+    return {str(r["level_id"]).upper(): int(r["c"]) for r in rows}
+
+
 async def _subject_gate_with_metadata(
     *,
     entries: list["CatalogEntry"],
@@ -283,6 +300,7 @@ async def _subject_gate_with_metadata(
 
     return kept
 
+
 async def ingest_by_coverage(
     *,
     coverage: str,
@@ -359,11 +377,27 @@ async def ingest_by_coverage(
                 e = next(it)
             except StopIteration:
                 return False
+
             check_levels = (level_hints & e.level_codes) if level_hints else set()
             if not check_levels:
+                # Nothing to check for this table per coverage expression → accept (no network)
+                async def _one_accept():
+                    return (e, True, {})
+                pending.add(asyncio.create_task(_one_accept()))
                 return True
 
-            async def _one(e_: CatalogEntry) -> tuple[CatalogEntry, bool, dict[str, list]]:
+            # 1) Try local DB counts first (only if table already ingested)
+            db_counts = await asyncio.to_thread(_db_counts_for_levels, e.id, check_levels)
+            have_all = bool(db_counts) and all(l.upper() in db_counts for l in check_levels)
+            if have_all:
+                ok_local = eval_coverage(cov_ast, db_counts)
+                async def _one_db():
+                    return (e, ok_local, {})
+                pending.add(asyncio.create_task(_one_db()))
+                return True
+
+            # 2) Fallback: live probe from API (also returns payloads we can reuse)
+            async def _one_net(e_: CatalogEntry) -> tuple[CatalogEntry, bool, dict[str, list]]:
                 per_table_timeout = max(10.0, 2.0 * float(get_settings().request_timeout))
                 try:
                     counts, payloads = await asyncio.wait_for(
@@ -371,14 +405,14 @@ async def ingest_by_coverage(
                         timeout=per_table_timeout,
                     )
                     ok = eval_coverage(cov_ast, counts)
-                    return e_, ok, payloads if ok else {}
+                    return e_, ok, (payloads if ok else {})
                 except Exception:
                     return e_, False, {}
 
-            t = asyncio.create_task(_one(e))
-            pending.add(t)
+            pending.add(asyncio.create_task(_one_net(e)))
             return True
 
+        # prime
         for _ in range(par_probe):
             if not await schedule_next():
                 break
@@ -386,25 +420,25 @@ async def ingest_by_coverage(
         probed = 0
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-        for t in done:
-            probed += 1
-            e, ok, payloads = await t
-            if ok:
-                kept.append(e)
-                if payloads:
-                    prefetched_localities[e.id] = payloads
+            for t in done:
+                probed += 1
+                e, ok, payloads = await t
+                if ok:
+                    kept.append(e)
+                    if payloads:
+                        prefetched_localities[e.id] = payloads
                 if (probed % 10 == 0) or (need and len(kept) >= need):
                     pct = (probed * 100) // max(1, total)
                     inflight = len(pending)
                     print(
-                        f"\r[probe] done={probed}/{total} "
-                        f"(accepted={len(kept)} • {pct}%) | inflight={inflight}",
+                        f"\r[probe] done={probed}/{total} (accepted={len(kept)} • {pct}%) | inflight={inflight}",
                         end="",
                         flush=True,
                     )
                 if need and len(kept) >= need:
                     pending.clear()
                     break
+
             while len(pending) < par_probe:
                 more = await schedule_next()
                 if not more:
@@ -416,10 +450,23 @@ async def ingest_by_coverage(
             kept = kept[:need]
         report.discovered_ids = [e.id for e in kept]
 
-        # 5) Skip existing + ingest
+        # 5) Skip existing + ingest (+ include historical failures)
         with sqlite_session() as conn:
             existing = {int(r[0]) for r in conn.execute("SELECT id FROM agregados")}
-        to_do = [e.id for e in kept if e.id not in existing]
+            past_failed = {
+                int(r[0])
+                for r in conn.execute(
+                    "SELECT DISTINCT agregado_id FROM ingestion_log WHERE status='error'"
+                )
+            }
+
+        # schedule = new-kept (not existing)  ∪  (historical failures not existing)
+        new_kept = [e.id for e in kept if e.id not in existing]
+        hist_retry = sorted(past_failed - existing)
+
+        to_do = list(dict.fromkeys([*new_kept, *hist_retry]))  # preserve order, dedupe
+
+        report.discovered_ids = [e.id for e in kept]  # unchanged semantics
         report.scheduled_ids = list(to_do)
         report.skipped_existing = [e.id for e in kept if e.id in existing]
 
@@ -431,16 +478,35 @@ async def ingest_by_coverage(
 
         async def worker(tid: int) -> None:
             async with sem:
-                try:
-                    await ingest_table(
-                        tid,
-                        prefetched_localities=prefetched_localities.get(tid),
-                    )
-                    report.ingested_ids.append(tid)
-                    print(f"  ingested {tid}")
-                except Exception as exc:
-                    report.failed.append((tid, str(exc)[:200]))
-                    print(f"  failed {tid}: {exc}")
+                # Per-table retry with short backoff (other tasks continue)
+                delays = (1.0, 3.0, 7.0)  # seconds
+                attempt = 0
+                while True:
+                    try:
+                        await ingest_table(tid)
+                        report.ingested_ids.append(tid)
+                        print(f"  ingested {tid}")
+                        return
+                    except Exception as exc:
+                        msg = str(exc)
+                        attempt += 1
+
+                        # Persistent server-side 500? Fail fast after 2 tries.
+                        if "statusCode\":500" in msg or " 500:" in msg:
+                            if attempt >= 2:
+                                report.failed.append((tid, msg[:200]))
+                                print(f"  failed {tid}: {exc} (permanent 500?)")
+                                return
+
+                        if attempt > len(delays):
+                            report.failed.append((tid, msg[:200]))
+                            print(f"  failed {tid}: {exc}")
+                            return
+
+                        backoff = delays[attempt - 1]
+                        print(f"  retry {tid} in {backoff:.0f}s (attempt {attempt+1})")
+                        await asyncio.sleep(backoff)
+
 
         await asyncio.gather(*(worker(t) for t in to_do))
 

@@ -5,7 +5,11 @@ import asyncio
 import json
 from dataclasses import asdict
 from typing import Sequence  # <- added
+from array import array
+import orjson
+import hashlib
 
+from ..config import get_settings
 from ..db.session import ensure_full_schema, sqlite_session
 from ..ingest.ingest_table import ingest_table
 from ..ingest.bulk import ingest_by_coverage
@@ -14,6 +18,7 @@ from ..net.embedding_client import EmbeddingClient
 from ..search.tables import SearchArgs, search_tables
 from ..search.fuzzy3gram import reset_cache
 from ..db.session import sqlite_session
+from ..ingest.ingest_table import _canonical_table_text  # reuse identical text
 
 def _print_json(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2))
@@ -175,6 +180,98 @@ def _cmd_search_tables(args: argparse.Namespace) -> None:
                 print(f"  score={h.score:.3f} (struct={h.struct_score:.3f}, rrf={h.rrf_score:.3f})")
 
 
+# ---------------------------
+# Embed
+# ---------------------------
+
+def _vec_to_blob(vec):
+    arr = array("f", (float(x) for x in vec))
+    return arr.tobytes()
+
+def _sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def _cmd_embed_titles(args: argparse.Namespace) -> None:
+    ensure_full_schema()
+    s = get_settings()
+    model = args.model or s.embedding_model
+    only_missing = bool(args.only_missing)
+    limit = args.limit if args.limit and args.limit > 0 else None
+
+    emb = EmbeddingClient()
+
+    # Iterate agregados and upsert embeddings if missing/stale
+    with sqlite_session() as conn:
+        rows = conn.execute(
+            "SELECT id, raw_json FROM agregados ORDER BY id"
+        ).fetchall()
+
+    count = 0
+    updated = 0
+    for r in rows:
+        if limit is not None and count >= limit:
+            break
+        tid = int(r["id"])
+        try:
+            md = orjson.loads(r["raw_json"])
+        except Exception:
+            continue
+
+        text = _canonical_table_text(md)
+        if not text.strip():
+            continue
+
+        text_hash = _sha256_text(text)
+
+        # Check existing
+        with sqlite_session() as conn:
+            cur = conn.execute(
+                "SELECT text_hash FROM embeddings WHERE entity_type='agregado' AND entity_id=? AND model=?",
+                (str(tid), model),
+            ).fetchone()
+            existing_hash = cur["text_hash"] if cur else None
+
+        if existing_hash == text_hash:
+            count += 1
+            continue
+        if only_missing and existing_hash is not None:
+            count += 1
+            continue
+
+        # Compute vector
+        try:
+            vec = emb.embed_text(text, model=model)
+        except Exception as exc:
+            print(f"embed failed for {tid}: {exc}")
+            count += 1
+            continue
+
+        # Upsert
+        with sqlite_session() as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO embeddings(
+                      entity_type, entity_id, agregado_id, text_hash, model, dimension, vector, created_at
+                    ) VALUES(?,?,?,?,?,?,?,datetime('now'))
+                    """,
+                    (
+                        "agregado",
+                        str(tid),
+                        tid,
+                        text_hash,
+                        model,
+                        len(vec),
+                        _vec_to_blob(vec),
+                    ),
+                )
+        updated += 1
+        count += 1
+
+    print(f"embed-titles: scanned={count}, updated={updated}, model={model}")
+
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sidra-search", description="Table-centric search & ingestion")
     sub = p.add_subparsers(dest="cmd")
@@ -223,11 +320,18 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--semantic", action="store_true", help="use semantic title ranking (requires embeddings)")
     st.add_argument("--explain", action="store_true", help="print match rationale and scores")
     st.add_argument("--json", action="store_true")
-    st.set_defaults(func=_cmd_search_tables)
     st.add_argument("--show-classes", action="store_true", help="List up to 3 classification names for each hit")
     st.add_argument("--debug-fuzzy", action="store_true", help="Print fuzzy expansions and candidate counts")
-    return p
+    st.set_defaults(func=_cmd_search_tables)
 
+    # embeddings backfill (ADD BEFORE RETURN)
+    et = sub.add_parser("embed-titles", help="(Re)embed table titles (idempotent)")
+    et.add_argument("--model", help="Embedding model name (defaults to settings)")
+    et.add_argument("--only-missing", action="store_true", help="Skip rows that already have an embedding, even if text changed")
+    et.add_argument("--limit", type=int, default=None, help="Limit number of tables processed")
+    et.set_defaults(func=_cmd_embed_titles)
+
+    return p
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
