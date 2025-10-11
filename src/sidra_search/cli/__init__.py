@@ -514,14 +514,15 @@ def _load_show_data(conn, table_id: int) -> dict:
         cid = int(c["id"])
         exc = _read_json_field(c["sumarizacao_excecao"], [])
         status = bool(c["sumarizacao_status"])
-        title = f"[{cid}] {c['nome']} — sumarização: {'on' if status else 'off'}"
+        title_line = f"[{cid}] {c['nome']} — sumarização: {'on' if status else 'off'}"
         if exc:
-            title += f" (exceção: {', '.join(map(str, exc))})"
-        class_cards.append((title, cats_by_class.get(cid, []), status))
+            title_line += f" (exceção: {', '.join(map(str, exc))})"
+        class_cards.append((title_line, cats_by_class.get(cid, []), status))
 
     return {
         "id": int(ag["id"]),
-        "nome": ag["nome"],
+        "title": ag["nome"],                 # <-- explicit title
+        "nome": ag["nome"],                  # (kept for compatibility)
         "url": url,
         "pesquisa": ag["pesquisa"],
         "assunto": ag["assunto"],
@@ -547,9 +548,12 @@ def _load_show_data(conn, table_id: int) -> dict:
 def _print_show_card(d: dict, *, width: int, max_vars: int = 8, max_cats: int = 12) -> None:
     w = width
     line = "-" * w
-    head = f"[{d['id']}] {d['nome']}".strip()
+    head = f"[{d['id']}] {d.get('title') or d.get('nome') or ''}".strip()
     print(head)
     print(line[:min(len(line), max(10, len(head)))])
+
+    # Explicit title line (so it’s unambiguous)
+    print(_fmt_wrap("Título", d.get("title") or d.get("nome") or "", w))
 
     print(_fmt_wrap("URL", d["url"], w))
     if d.get("pesquisa"):
