@@ -7,7 +7,7 @@ import json
 import sys
 from array import array
 from dataclasses import asdict
-from typing import Sequence
+from typing import Sequence, Any
 
 import orjson
 
@@ -21,6 +21,8 @@ from ..net.embedding_client import EmbeddingClient
 from ..search.fuzzy3gram import reset_cache
 from ..search.tables import SearchArgs, search_tables
 from ..search.where_expr import parse_where_expr
+import shutil
+import textwrap
 
 
 CLI_MANUAL = """\
@@ -372,6 +374,259 @@ def _cmd_embed_titles(args: argparse.Namespace) -> None:
 
     print(f"embed-titles: scanned={count}, updated={updated}, model={model}")
 
+# ---------------------------
+# Show (concise, pretty card per table from local DB)
+# ---------------------------
+def _term_width(default: int = 100) -> int:
+    try:
+        return max(60, int(shutil.get_terminal_size(fallback=(default, 20)).columns))
+    except Exception:
+        return default
+
+def _fmt_wrap(label: str, text: str, width: int, indent: int = 2) -> str:
+    if not text:
+        return ""
+    body = textwrap.fill(text, width=width, subsequent_indent=" " * (len(label) + 2))
+    return f"{label}: {body}"
+
+def _fmt_inline_list(items: list[str], max_items: int) -> str:
+    if not items:
+        return "-"
+    if len(items) <= max_items:
+        return ", ".join(items)
+    head = ", ".join(items[:max_items])
+    rest = len(items) - max_items
+    return f"{head} … (+{rest})"
+
+def _fmt_periods(periods: list[str], width: int, max_inline: int = 12) -> str:
+    if not periods:
+        return "–"
+    s = _fmt_inline_list(periods, max_inline)
+    return textwrap.fill(s, width=width)
+
+def _read_json_field(val: Any, fallback):
+    try:
+        if not val:
+            return fallback
+        return orjson.loads(val)
+    except Exception:
+        return fallback
+
+def _load_show_data(conn, table_id: int) -> dict:
+    ag = conn.execute(
+        """
+        SELECT id, nome, url, pesquisa, assunto, freq, periodo_inicio, periodo_fim,
+               municipality_locality_count, covers_national_municipalities
+        FROM agregados
+        WHERE id=?
+        """,
+        (table_id,),
+    ).fetchone()
+    if not ag:
+        raise RuntimeError(f"table {table_id} not found in local DB (ingest it first)")
+
+    # URL fallback
+    url = ag["url"] or f"https://sidra.ibge.gov.br/tabela/{int(ag['id'])}"
+
+    # periods (full)
+    periods = [
+        r["periodo_id"]
+        for r in conn.execute(
+            """
+            SELECT periodo_id
+            FROM periods
+            WHERE agregado_id=?
+            ORDER BY COALESCE(periodo_ord, 99999999), periodo_id
+            """,
+            (table_id,),
+        ).fetchall()
+    ]
+
+    # levels + headline N3/N6
+    levels_by_type: dict[str, list[str]] = {}
+    n3 = n6 = 0
+    for r in conn.execute(
+        """
+        SELECT level_type, level_id, locality_count
+        FROM agregados_levels
+        WHERE agregado_id=?
+        ORDER BY level_type, level_id
+        """,
+        (table_id,),
+    ).fetchall():
+        lt = str(r["level_type"] or "")
+        lv = str(r["level_id"] or "")
+        if lt and lv:
+            levels_by_type.setdefault(lt, [])
+            if lv not in levels_by_type[lt]:
+                levels_by_type[lt].append(lv)
+        if lv.upper() == "N3":
+            n3 = int(r["locality_count"] or 0)
+        if lv.upper() == "N6":
+            n6 = int(r["locality_count"] or 0)
+
+    # variables
+    vars_out = []
+    for r in conn.execute(
+        """
+        SELECT id, nome, unidade, sumarizacao
+        FROM variables
+        WHERE agregado_id=?
+        ORDER BY id
+        """,
+        (table_id,),
+    ):
+        sumarizacao = _read_json_field(r["sumarizacao"], [])
+        sigma = f" Σ[{', '.join(sumarizacao)}]" if sumarizacao else ""
+        unit = f" ({r['unidade']})" if r["unidade"] else ""
+        vars_out.append(f"[{int(r['id'])}] {r['nome']}{unit}{sigma}")
+
+    # classes + categories
+    classes = conn.execute(
+        """
+        SELECT id, nome, sumarizacao_status, sumarizacao_excecao
+        FROM classifications
+        WHERE agregado_id=?
+        ORDER BY id
+        """,
+        (table_id,),
+    ).fetchall()
+    cats_rows = conn.execute(
+        """
+        SELECT classification_id, categoria_id, nome, unidade, nivel
+        FROM categories
+        WHERE agregado_id=?
+        ORDER BY classification_id, categoria_id
+        """,
+        (table_id,),
+    ).fetchall()
+    cats_by_class: dict[int, list[str]] = {}
+    for cr in cats_rows:
+        nm = cr["nome"]
+        if cr["unidade"]:
+            nm = f"{nm} ({cr['unidade']})"
+        if cr["nivel"] is not None:
+            nm = f"{nm} [n{cr['nivel']}]"
+        cats_by_class.setdefault(int(cr["classification_id"]), []).append(nm)
+
+    class_cards: list[tuple[str, list[str], bool]] = []
+    for c in classes:
+        cid = int(c["id"])
+        exc = _read_json_field(c["sumarizacao_excecao"], [])
+        status = bool(c["sumarizacao_status"])
+        title = f"[{cid}] {c['nome']} — sumarização: {'on' if status else 'off'}"
+        if exc:
+            title += f" (exceção: {', '.join(map(str, exc))})"
+        class_cards.append((title, cats_by_class.get(cid, []), status))
+
+    return {
+        "id": int(ag["id"]),
+        "nome": ag["nome"],
+        "url": url,
+        "pesquisa": ag["pesquisa"],
+        "assunto": ag["assunto"],
+        "freq": ag["freq"],
+        "periodo_inicio": ag["periodo_inicio"],
+        "periodo_fim": ag["periodo_fim"],
+        "periods": periods,
+        "levels": levels_by_type,
+        "n3": n3,
+        "n6": n6,
+        "mun_count": int(ag["municipality_locality_count"] or 0),
+        "covers_nat": bool(ag["covers_national_municipalities"]),
+        "vars": vars_out,
+        "classes": class_cards,
+        "counts": {
+            "vars": len(vars_out),
+            "classes": len(classes),
+            "cats": len(cats_rows),
+            "periods": len(periods),
+        },
+    }
+
+def _print_show_card(d: dict, *, width: int, max_vars: int = 8, max_cats: int = 12) -> None:
+    w = width
+    line = "-" * w
+    head = f"[{d['id']}] {d['nome']}".strip()
+    print(head)
+    print(line[:min(len(line), max(10, len(head)))])
+
+    print(_fmt_wrap("URL", d["url"], w))
+    if d.get("pesquisa"):
+        print(_fmt_wrap("Pesquisa", d["pesquisa"], w))
+    if d.get("assunto"):
+        print(_fmt_wrap("Assunto", d["assunto"], w))
+
+    # Periodicidade
+    freq = d.get("freq") or "—"
+    pi = d.get("periodo_inicio")
+    pf = d.get("periodo_fim")
+    rng = f"{pi}–{pf}" if (pi and pf and pi != pf) else (pi or pf or "—")
+    print(f"Periodicidade: {freq} | {rng} ({d['counts']['periods']} períodos)")
+    print("Períodos: " + _fmt_periods(d["periods"], w))
+
+    # Coverage headline
+    cov_bits = [f"N3={d['n3']}", f"N6={d['n6']}"]
+    if d["mun_count"]:
+        cov_bits.append(f"municípios={d['mun_count']}")
+    if d["covers_nat"]:
+        cov_bits.append("cobre_malha_municipal=nacional")
+    print("Cobertura: " + ", ".join(cov_bits))
+
+    # Levels
+    if d["levels"]:
+        parts = []
+        for lt, ids in d["levels"].items():
+            parts.append(f"{lt}=[{', '.join(ids) if ids else '-'}]")
+        print("Níveis: " + " | ".join(parts))
+
+    # Variables
+    print(f"Variáveis ({d['counts']['vars']}):")
+    if d["vars"]:
+        show_vars = d["vars"][:max_vars]
+        for v in show_vars:
+            print("  - " + textwrap.shorten(v, width=w - 6, placeholder="…"))
+        if d["counts"]["vars"] > len(show_vars):
+            print(f"  … (+{d['counts']['vars'] - len(show_vars)})")
+    else:
+        print("  (nenhuma)")
+
+    # Classifications + categories
+    print(f"Classificações ({d['counts']['classes']}, categorias={d['counts']['cats']}):")
+    if not d["classes"]:
+        print("  (nenhuma)")
+    else:
+        for title, cat_names, _status in d["classes"]:
+            print("  • " + textwrap.shorten(title, width=w - 4, placeholder="…"))
+            if cat_names:
+                cats_line = _fmt_inline_list(cat_names, max_cats)
+                wrapped = textwrap.fill(cats_line, width=w - 6, subsequent_indent="      ")
+                print("     categorias: " + wrapped)
+            else:
+                print("     categorias: –")
+
+    print()  # blank line after each card
+
+def _cmd_show(args: argparse.Namespace) -> None:
+    ensure_full_schema()
+    w = args.wrap if args.wrap and args.wrap > 0 else _term_width()
+    with sqlite_session() as conn:
+        objs = []
+        for tid in args.table_ids:
+            try:
+                d = _load_show_data(conn, int(tid))
+                objs.append(d)
+            except Exception as exc:
+                msg = {"id": int(tid), "error": str(exc)}
+                if args.json:
+                    print(json.dumps(msg, ensure_ascii=False, indent=2))
+                else:
+                    print(f"[{tid}] ERROR: {exc}")
+        if args.json and objs:
+            print(json.dumps(objs if len(objs) > 1 else objs[0], ensure_ascii=False, indent=2))
+            return
+        for d in objs:
+            _print_show_card(d, width=w, max_vars=args.max_vars, max_cats=args.max_cats)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -465,6 +720,15 @@ def build_parser() -> argparse.ArgumentParser:
     et.add_argument("--only-missing", action="store_true", help="Skip rows that already have an embedding, even if text changed")
     et.add_argument("--limit", type=int, default=None, help="Limit number of tables processed")
     et.set_defaults(func=_cmd_embed_titles)
+    
+    # show
+    sh = sub.add_parser("show", help="Concise, pretty metadata for one or more tables (from local DB)")
+    sh.add_argument("table_ids", type=int, nargs="+", help="One or more table IDs")
+    sh.add_argument("--wrap", type=int, default=None, help="Wrap width (defaults to terminal width)")
+    sh.add_argument("--max-vars", type=int, default=8, help="Max variables to list inline")
+    sh.add_argument("--max-cats", type=int, default=12, help="Max categories per classification to list inline")
+    sh.add_argument("--json", action="store_true", help="Output JSON instead of the pretty view")
+    sh.set_defaults(func=_cmd_show)
 
     return p
 
