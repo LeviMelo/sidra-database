@@ -1,4 +1,4 @@
-````markdown
+
 # sidra-search
 
 Table-centric search and ingestion for **IBGE SIDRA** datasets (agregados).  
@@ -10,38 +10,37 @@ Ingest SIDRA table metadata into a local **SQLite** database, build fast name in
 
 ## Contents
 
-- [Highlights](#highlights)
-- [Quick Start](#quick-start)
-- [Installation](#installation)
-- [Environment Variables](#environment-variables)
-- [CLI Overview](#cli-overview)
-  - [db](#db)
-  - [ingest](#ingest)
-  - [ingest-coverage](#ingest-coverage)
-  - [build-links](#build-links)
-  - [embed-titles (optional)](#embed-titles-optional)
-  - [search](#search)
-  - [show](#show)
-- [Unified Query Language](#unified-query-language)
-  - [Fields](#fields)
-  - [Contains (`~`)](#contains-)
-  - [Coverage (N-levels)](#coverage-n-levels)
-  - [Periods](#periods)
-  - [Examples](#examples)
-- [Output Examples](#output-examples)
-- [Architecture & Design](#architecture--design)
-  - [Database Schema (base)](#database-schema-base)
-  - [Search Schema](#search-schema)
-  - [Search Flow](#search-flow)
-  - [Performance Notes](#performance-notes)
-- [Troubleshooting](#troubleshooting)
-- [FAQ](#faq)
-- [Development](#development)
-  - [Project Layout](#project-layout)
-  - [Coding Notes](#coding-notes)
-- [License](#license)
-
----
+- [sidra-search](#sidra-search)
+  - [Contents](#contents)
+  - [Highlights](#highlights)
+  - [Quick Start](#quick-start)
+  - [Installation](#installation)
+  - [Environment Variables](#environment-variables)
+  - [CLI Overview](#cli-overview)
+    - [db](#db)
+    - [ingest](#ingest)
+    - [ingest-coverage](#ingest-coverage)
+    - [build-links](#build-links)
+    - [embed-titles (optional)](#embed-titles-optional)
+    - [search](#search)
+    - [show](#show)
+  - [Unified Query Language](#unified-query-language)
+    - [Fields](#fields)
+    - [Contains (`~`)](#contains-)
+    - [Coverage (N-levels)](#coverage-n-levels)
+    - [Periods](#periods)
+    - [Examples](#examples)
+  - [Output Examples](#output-examples)
+  - [Architecture \& Design](#architecture--design)
+    - [Database Schema (base)](#database-schema-base)
+    - [Search Schema](#search-schema)
+    - [Search Flow](#search-flow)
+    - [Performance Notes](#performance-notes)
+  - [Troubleshooting](#troubleshooting)
+  - [FAQ](#faq)
+  - [Development](#development)
+    - [Project Layout](#project-layout)
+    - [Coding Notes](#coding-notes)
 
 ## Highlights
 
