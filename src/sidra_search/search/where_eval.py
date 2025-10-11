@@ -72,11 +72,40 @@ def _eval_contains(node: _Contains, table_ctx: dict[str, Any]) -> bool:
     values = _field_values(table_ctx, node.field)
     if not values:
         return False
+
+    # Simple literal case
     if isinstance(node.needle, _StrLit):
-        needle = normalize_basic(node.needle.text)
+        raw = node.needle.text
+        if not raw:
+            return True  # empty literal is trivially true
+
+        # Special handling for categories: allow strict "Class::Cat" and loose "Cat"
+        if node.field.upper() == "CAT":
+            if "::" in raw:
+                # strict pair
+                class_part, cat_part = raw.split("::", 1)
+                ck = normalize_basic(class_part)
+                cat = normalize_basic(cat_part)
+                if not ck or not cat:
+                    return False
+                target = f"{ck}::{cat}"
+                # accept exact strict pair or any value that clearly contains both class and cat tokens
+                return any(v == target or (ck in v and cat in v) for v in values)
+            else:
+                # loose category name — try both normal and "flattened" representations (treat '::' like space)
+                needle = normalize_basic(raw)
+                if not needle:
+                    return True
+                flattened = [v.replace("::", " ") for v in values]
+                return any(needle in v for v in values) or any(needle in v for v in flattened)
+
+        # Default contains (accent/punct-insensitive substring)
+        needle = normalize_basic(raw)
         if not needle:
             return True
         return any(needle in v for v in values)
+
+    # Composite contains expression: evaluate tree with substring semantics
     for value in values:
         if _eval_contains_expr(node.needle, value):
             return True

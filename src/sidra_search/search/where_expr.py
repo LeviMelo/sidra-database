@@ -218,8 +218,9 @@ class _Parser:
         return _Cmp(op, ident, number)
 
     def _period_expr(self) -> WhereNode:
-        if self.cur.kind == "ID" and self.cur.value == "IN":
-            self._eat("ID")
+        # Support: PERIOD IN [YYYY..YYYY]
+        if self.cur.kind == "IN":
+            self._eat("IN")
             self._eat("LBRACK")
             start = int(self._eat("NUM").value)
             self._eat("RANGE")
@@ -228,6 +229,8 @@ class _Parser:
             if end < start:
                 raise SyntaxError("period range end < start")
             return _PeriodRange(start, end)
+
+        # Support: PERIOD {>, >=, ==, !=, <, <=} YYYY
         if self.cur.kind != "OP":
             raise SyntaxError("Expected comparator or IN after PERIOD")
         op = self._eat("OP").value

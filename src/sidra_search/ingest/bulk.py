@@ -418,6 +418,7 @@ async def ingest_by_coverage(
                 break
 
         probed = 0
+        stop = False
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for t in done:
@@ -436,8 +437,11 @@ async def ingest_by_coverage(
                         flush=True,
                     )
                 if need and len(kept) >= need:
+                    stop = True
                     pending.clear()
                     break
+            if stop:
+                break
 
             while len(pending) < par_probe:
                 more = await schedule_next()
@@ -483,7 +487,7 @@ async def ingest_by_coverage(
                 attempt = 0
                 while True:
                     try:
-                        await ingest_table(tid)
+                        await ingest_table(tid, prefetched_localities=prefetched_localities.get(tid))
                         report.ingested_ids.append(tid)
                         print(f"  ingested {tid}")
                         return

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Keep DB in repo root
+export SIDRA_DATABASE_PATH="${SIDRA_DATABASE_PATH:-"$(pwd)/sidra.db"}"
+
 echo "== sanity: pick DB in repo root =="
-export SIDRA_DATABASE_PATH="$(pwd)/sidra.db"
 python -m sidra_search.cli db stats
 
 echo
@@ -11,7 +13,7 @@ python -m sidra_search.cli --manual | head -n 20
 
 echo
 echo "== A) unified boolean search examples =="
-python -m sidra_search.cli search --q '(class~"sexo" OR var~"pessoas") AND (N6>=5000 OR N3==27)' --limit 10 --debug-fuzzy || true
+python -m sidra_search.cli search --q '(class~"sexo" OR var~"pessoas") AND (N6>=5000 OR N3==27)' --limit 10 || true
 
 echo
 python -m sidra_search.cli search --q 'class~("sexo" AND NOT "agro")' --limit 10 --explain || true
@@ -48,9 +50,8 @@ python -m sidra_search.cli search --title "pessoas indígenas" --coverage "(N6>=
 python -m sidra_search.cli search --q 'title~"pessoas indígenas" AND ((N6>=5000) OR N3)' --limit 5 || true
 
 echo
-echo "== D) smoke ingest/build remains available =="
+echo "== D) ingest sanity (no build-links to keep output quiet) =="
 python -m sidra_search.cli ingest-coverage --coverage "N3 OR (N6>=5000)" --limit 3 || true
-python -m sidra_search.cli build-links --all || true
 
 echo
 echo "== E) manual reminder =="

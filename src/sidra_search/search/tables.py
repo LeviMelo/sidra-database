@@ -4,7 +4,7 @@ import asyncio
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from array import array
 
@@ -15,7 +15,7 @@ from ..net.embedding_client import EmbeddingClient
 from ..search.normalize import normalize_basic
 from ..search.title_rank import rrf
 from .where_eval import eval_where
-from .where_expr import WhereNode, iter_contains_literals
+from .where_expr import WhereNode, iter_contains_literals, _Contains, _StrLit, _And, _Or, _Not 
 from ..search.fuzzy3gram import similar_keys
 
 
@@ -114,6 +114,25 @@ def _positive_literals(where: WhereNode | None) -> Dict[str, List[str]]:
         out.setdefault(field.upper(), []).append(text)
     return out
 
+def _strip_title_contains(node: WhereNode) -> WhereNode:
+    """
+    Return a copy of the WHERE AST where TITLE~(...) constraints are replaced by a tautology.
+    This lets us keep other filters (period, var/class/cat, survey/subject) while
+    allowing the semantic title layer to take over when lexical title contains fails.
+    """
+    if isinstance(node, _Contains) and str(node.field).upper() == "TITLE":
+        # any non-empty _StrLit evaluates to True in eval_where
+        return _StrLit("1")
+
+    if isinstance(node, _Not):
+        return _Not(_strip_title_contains(node.node))
+    if isinstance(node, _And):
+        return _And(_strip_title_contains(node.left), _strip_title_contains(node.right))
+    if isinstance(node, _Or):
+        return _Or(_strip_title_contains(node.left), _strip_title_contains(node.right))
+    # all other nodes unchanged
+    return node
+
 
 def _build_literal_queries(
     field: str,
@@ -166,7 +185,7 @@ def _prefilter_agregado_text(
     column: str,
     needles: Iterable[str],
 ) -> Set[int]:
-    # TODO: cache normalized aggregates or add an index if catalog size makes this scan hot.
+    # NOTE: still a scan, but cheap relative to per-table context loads.
     normalized = [normalize_basic(n) for n in needles if normalize_basic(n)]
     if not normalized:
         return set()
@@ -183,6 +202,8 @@ def _prefilter_title_fts(conn, literals: Iterable[str]) -> Set[int]:
     settings = get_settings()
     if not settings.enable_titles_fts:
         return set()
+
+    # Build a broad OR query over individual tokens; also include full phrases
     terms: List[str] = []
     for lit in literals:
         norm = normalize_basic(lit)
@@ -191,13 +212,20 @@ def _prefilter_title_fts(conn, literals: Iterable[str]) -> Set[int]:
         tokens = [t for t in norm.split() if t]
         if not tokens:
             continue
-        if len(tokens) == 1:
-            terms.append(tokens[0])
-        else:
+        # OR all tokens for recall
+        terms.extend(tokens)
+        # keep the full phrase too (acts like a bonus signal)
+        if len(tokens) > 1:
             terms.append(" ".join(tokens))
+
     if not terms:
         return set()
-    query = " OR ".join(f'"{t}"' if " " in t else t for t in terms)
+
+    # De-dupe and quote phrases for FTS
+    uniq: List[str] = list(dict.fromkeys(terms))
+    pieces = [f'"{t}"' if " " in t else t for t in uniq]
+    query = " OR ".join(pieces)
+
     rows = conn.execute(
         "SELECT DISTINCT table_id FROM table_titles_fts WHERE table_titles_fts MATCH ?",
         (query,),
@@ -219,126 +247,153 @@ def _extract_years(pid: Any, pord: Any) -> Set[int]:
     return years
 
 
-def _load_table_context(conn, table_id: int) -> _TableContext:
-    row = conn.execute(
-        """
-        SELECT id, nome, pesquisa, assunto, periodo_inicio, periodo_fim
-        FROM agregados
-        WHERE id=?
-        """,
-        (table_id,),
-    ).fetchone()
-    if not row:
-        empty = _TableContext(
-            title="",
-            title_norm="",
-            survey="",
-            survey_norm="",
-            subject="",
-            subject_norm="",
-            vars=[],
-            classes=[],
-            cats=[],
-            cat_any=set(),
-            class_cat_map={},
-            var_class_map={},
-            coverage_counts={},
-            period_years=set(),
-            period_start=None,
-            period_end=None,
-            n3=0,
-            n6=0,
-        )
-        return empty
+# ------------- NEW: bulk context loader (batched) -------------
+def _bulk_load_contexts(conn, table_ids: Sequence[int], *, batch_size: int = 400) -> Dict[int, _TableContext]:
+    """
+    Load _TableContext for many tables in batches with a handful of queries per batch,
+    instead of 6–7 queries per table. This is the core perf fix.
+    """
+    if not table_ids:
+        return {}
 
-    title = str(row["nome"] or "")
-    survey = str(row["pesquisa"] or "")
-    subject = str(row["assunto"] or "")
+    out: Dict[int, _TableContext] = {}
+    norm = normalize_basic
 
-    var_rows = conn.execute(
-        "SELECT var_key FROM link_var WHERE table_id=?",
-        (table_id,),
-    ).fetchall()
-    vars_list = [normalize_basic(str(r["var_key"] or "")) for r in var_rows if r["var_key"]]
+    for start in range(0, len(table_ids), batch_size):
+        batch = list(table_ids[start : start + batch_size])
+        ph = ",".join("?" for _ in batch)
 
-    class_rows = conn.execute(
-        "SELECT class_key FROM link_class WHERE table_id=?",
-        (table_id,),
-    ).fetchall()
-    classes_list = [normalize_basic(str(r["class_key"] or "")) for r in class_rows if r["class_key"]]
+        # 1) headers
+        hdr_rows = conn.execute(
+            f"""
+            SELECT id, nome, pesquisa, assunto, periodo_inicio, periodo_fim
+            FROM agregados
+            WHERE id IN ({ph})
+            """,
+            batch,
+        ).fetchall()
+        # seed contexts
+        for r in hdr_rows:
+            tid = int(r["id"])
+            title = str(r["nome"] or "")
+            survey = str(r["pesquisa"] or "")
+            subject = str(r["assunto"] or "")
+            out[tid] = _TableContext(
+                title=title,
+                title_norm=norm(title),
+                survey=survey,
+                survey_norm=norm(survey),
+                subject=subject,
+                subject_norm=norm(subject),
+                vars=[],
+                classes=[],
+                cats=[],
+                cat_any=set(),
+                class_cat_map={},
+                var_class_map={},
+                coverage_counts={},
+                period_years=set(),
+                period_start=r["periodo_inicio"],
+                period_end=r["periodo_fim"],
+                n3=0,
+                n6=0,
+            )
 
-    var_class_rows = conn.execute(
-        "SELECT var_key, class_key FROM link_var_class WHERE table_id=?",
-        (table_id,),
-    ).fetchall()
-    var_class_map: Dict[str, Set[str]] = {}
-    for r in var_class_rows:
-        vkey = normalize_basic(str(r["var_key"] or ""))
-        ckey = normalize_basic(str(r["class_key"] or ""))
-        if vkey and ckey:
-            var_class_map.setdefault(vkey, set()).add(ckey)
+        if not out:
+            continue  # none of these batch ids exist
 
-    cat_rows = conn.execute(
-        "SELECT class_key, cat_key FROM link_cat WHERE table_id=?",
-        (table_id,),
-    ).fetchall()
-    cats_list: List[str] = []
-    cat_any: Set[str] = set()
-    class_cat_map: Dict[str, Set[str]] = {}
-    for r in cat_rows:
-        class_key_raw = str(r["class_key"] or "")
-        cat_key_raw = str(r["cat_key"] or "")
-        class_key = normalize_basic(class_key_raw)
-        cat_key = normalize_basic(cat_key_raw)
-        if not cat_key:
-            continue
-        cat_any.add(cat_key)
-        cats_list.append(cat_key)
-        if class_key:
-            cats_list.append(f"{class_key}::{cat_key}")
-            class_cat_map.setdefault(class_key, set()).add(cat_key)
+        # 2) link_var
+        for r in conn.execute(
+            f"SELECT table_id, var_key FROM link_var WHERE table_id IN ({ph})",
+            batch,
+        ):
+            tid = int(r["table_id"])
+            if tid not in out:
+                continue
+            v = norm(str(r["var_key"] or ""))
+            if v:
+                out[tid].vars.append(v)
 
-    cov_rows = conn.execute(
-        "SELECT level_id, locality_count FROM agregados_levels WHERE agregado_id=?",
-        (table_id,),
-    ).fetchall()
-    coverage = {str(r["level_id"]).upper(): int(r["locality_count"] or 0) for r in cov_rows}
+        # 3) link_class
+        for r in conn.execute(
+            f"SELECT table_id, class_key FROM link_class WHERE table_id IN ({ph})",
+            batch,
+        ):
+            tid = int(r["table_id"])
+            if tid not in out:
+                continue
+            c = norm(str(r["class_key"] or ""))
+            if c:
+                out[tid].classes.append(c)
 
-    period_rows = conn.execute(
-        "SELECT periodo_id, periodo_ord FROM periods WHERE agregado_id=?",
-        (table_id,),
-    ).fetchall()
-    years: Set[int] = set()
-    for r in period_rows:
-        years |= _extract_years(r["periodo_id"], r["periodo_ord"])
+        # 4) link_var_class
+        for r in conn.execute(
+            f"SELECT table_id, var_key, class_key FROM link_var_class WHERE table_id IN ({ph})",
+            batch,
+        ):
+            tid = int(r["table_id"])
+            if tid not in out:
+                continue
+            v = norm(str(r["var_key"] or ""))
+            c = norm(str(r["class_key"] or ""))
+            if v and c:
+                out[tid].var_class_map.setdefault(v, set()).add(c)
 
-    cats_unique = list(dict.fromkeys(cats_list))
+        # 5) link_cat
+        for r in conn.execute(
+            f"SELECT table_id, class_key, cat_key FROM link_cat WHERE table_id IN ({ph})",
+            batch,
+        ):
+            tid = int(r["table_id"])
+            if tid not in out:
+                continue
+            ck_raw = str(r["class_key"] or "")
+            cat_raw = str(r["cat_key"] or "")
+            ck = norm(ck_raw)
+            cat = norm(cat_raw)
+            if not cat:
+                continue
+            ctx = out[tid]
+            ctx.cat_any.add(cat)
+            ctx.cats.append(cat)
+            if ck:
+                ctx.cats.append(f"{ck}::{cat}")
+                ctx.class_cat_map.setdefault(ck, set()).add(cat)
 
-    return _TableContext(
-        title=title,
-        title_norm=normalize_basic(title),
-        survey=survey,
-        survey_norm=normalize_basic(survey),
-        subject=subject,
-        subject_norm=normalize_basic(subject),
-        vars=list(dict.fromkeys(v for v in vars_list if v)),
-        classes=list(dict.fromkeys(c for c in classes_list if c)),
-        cats=cats_unique,
-        cat_any=cat_any,
-        class_cat_map=class_cat_map,
-        var_class_map=var_class_map,
-        coverage_counts=coverage,
-        period_years=years,
-        period_start=row["periodo_inicio"],
-        period_end=row["periodo_fim"],
-        n3=int(coverage.get("N3", 0)),
-        n6=int(coverage.get("N6", 0)),
-    )
+        # 6) coverage / levels
+        for r in conn.execute(
+            f"SELECT agregado_id, level_id, locality_count FROM agregados_levels WHERE agregado_id IN ({ph})",
+            batch,
+        ):
+            tid = int(r["agregado_id"])
+            if tid not in out:
+                continue
+            lvl = str(r["level_id"]).upper() if r["level_id"] else ""
+            cnt = int(r["locality_count"] or 0)
+            if lvl:
+                out[tid].coverage_counts[lvl] = cnt
+                if lvl == "N3":
+                    out[tid].n3 = cnt
+                elif lvl == "N6":
+                    out[tid].n6 = cnt
 
+        # 7) periods → years
+        for r in conn.execute(
+            f"SELECT agregado_id, periodo_id, periodo_ord FROM periods WHERE agregado_id IN ({ph})",
+            batch,
+        ):
+            tid = int(r["agregado_id"])
+            if tid not in out:
+                continue
+            out[tid].period_years |= _extract_years(r["periodo_id"], r["periodo_ord"])
 
-def _semantic_notice(enabled: bool, msg: str) -> None:
-    if enabled:
-        print(msg)
+        # de-dup preserve order for vars/classes/cats (like original)
+        for tid, ctx in out.items():
+            ctx.vars = list(dict.fromkeys(v for v in ctx.vars if v))
+            ctx.classes = list(dict.fromkeys(c for c in ctx.classes if c))
+            ctx.cats = list(dict.fromkeys(ctx.cats))
+
+    return out
 
 
 def _parse_cat_requirements(cat_literals: Iterable[str]) -> _CatRequirements:
@@ -600,6 +655,7 @@ async def search_tables(
         candidates: Optional[Set[int]] = None
         pre_counts: Dict[str, int] = {}
 
+        # Prefilters (positive-only; safe and already in your design)
         var_hints = {normalize_basic(x) for x in positives.get("VAR", []) if normalize_basic(x)}
         if var_hints:
             ids = _prefilter_link_exact(conn, "link_var", "var_key", var_hints)
@@ -614,6 +670,7 @@ async def search_tables(
                 candidates = set(ids) if candidates is None else candidates & ids
             pre_counts["class"] = len(ids)
 
+        # categories: loose and strict
         cat_hints = set(cat_req.loose)
         for cats in cat_req.strict.values():
             cat_hints.update(cats)
@@ -644,6 +701,7 @@ async def search_tables(
                 candidates = set(ids) if candidates is None else candidates & ids
             pre_counts["subject"] = len(ids)
 
+        # Fallback universe if hints produced nothing
         if candidates is None:
             rows = conn.execute("SELECT id FROM agregados").fetchall()
             candidates = {int(r[0]) for r in rows}
@@ -661,27 +719,43 @@ async def search_tables(
                 )
             )
 
-        ctx_cache: Dict[int, _TableContext] = {}
+        # --------- NEW: bulk-load contexts for all candidates (batched) ---------
+        cand_list_all = sorted(candidates)
+        ctx_by_id = _bulk_load_contexts(conn, cand_list_all, batch_size=400)
 
-        def get_ctx(tid: int) -> _TableContext:
-            ctx = ctx_cache.get(tid)
-            if ctx is None:
-                ctx = _load_table_context(conn, tid)
-                ctx_cache[tid] = ctx
-            return ctx
-
+        # where-eval filter (re-uses same contexts; no per-table DB work)
         if where_ast:
             filtered: Set[int] = set()
-            for tid in candidates:
-                ctx = get_ctx(tid)
+            for tid in cand_list_all:
+                ctx = ctx_by_id.get(tid)
+                if not ctx:
+                    continue
                 if eval_where(where_ast, table_ctx=ctx.__dict__):
                     filtered.add(tid)
             candidates = filtered
+        
+        # --- Semantic fallback:
+        # If TITLE literals exist and the lexical WHERE wiped out all candidates,
+        # re-evaluate the WHERE with TITLE contains removed (keep all other filters).
+        title_literals = positives.get("TITLE", [])
+        if not candidates and args.semantic and title_literals:
+            where_no_title = _strip_title_contains(where_ast) if where_ast else None
+            if where_no_title:
+                filtered2: Set[int] = set()
+                for tid in cand_list_all:
+                    ctx = ctx_by_id.get(tid)
+                    if not ctx:
+                        continue
+                    if eval_where(where_no_title, table_ctx=ctx.__dict__):
+                        filtered2.add(tid)
+                candidates = filtered2
 
         if not candidates:
-            _semantic_notice(args.semantic, "semantic: no tables matched filters; skipping embeddings")
+            if args.semantic:
+                print("semantic: no tables matched filters; skipping embeddings")
             return []
 
+        # ---------- Title ranking (lexical + semantic) ----------
         lexical_ranks: Dict[int, int] = {}
         semantic_ranks: Dict[int, int] = {}
 
@@ -711,9 +785,9 @@ async def search_tables(
         if args.semantic:
             settings = get_settings()
             if not title_text.strip():
-                _semantic_notice(args.semantic, "[semantic] no title literals in query; skipping embeddings")
+                print("[semantic] no title literals in query; skipping embeddings")
             elif not settings.enable_title_embeddings:
-                _semantic_notice(args.semantic, "semantic disabled: ENABLE_TITLE_EMBEDDINGS=0")
+                print("semantic disabled: ENABLE_TITLE_EMBEDDINGS=0")
             else:
                 model = semantic_client.model if semantic_client else settings.embedding_model
                 row = conn.execute(
@@ -722,7 +796,7 @@ async def search_tables(
                 ).fetchone()
                 count = int(row[0]) if row else 0
                 if count == 0:
-                    _semantic_notice(args.semantic, "semantic: no table embeddings found; run `embed-titles`")
+                    print("semantic: no table embeddings found; run `embed-titles`")
                 else:
                     semantic_enabled = True
                     if semantic_client is None:
@@ -733,7 +807,7 @@ async def search_tables(
                     lambda: semantic_client.embed_text(title_text, model=semantic_client.model)
                 )
             except Exception as exc:
-                _semantic_notice(args.semantic, f"semantic: embeddings request failed: {exc} (continuing without)")
+                print(f"semantic: embeddings request failed: {exc} (continuing without)")
                 qvec = None
             if qvec:
                 ordered = sorted(
@@ -776,9 +850,12 @@ async def search_tables(
         combined_ranks.update(semantic_ranks)
         rrf_scores = rrf(combined_ranks, k=60.0)
 
+        # ---------- Assemble hits (no extra DB — reuse contexts) ----------
         hits: List[TableHit] = []
-        for tid in candidates:
-            ctx = get_ctx(tid)
+        for tid in sorted(candidates):
+            ctx = ctx_by_id.get(tid)
+            if not ctx:
+                continue
             struct_info = _structural_for_table(
                 ctx,
                 var_scores=var_scores,
